@@ -1,0 +1,4 @@
+requests
+supabase
+openai
+python-dotenv
