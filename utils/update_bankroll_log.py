@@ -27,8 +27,12 @@ def update_bankroll_log():
 
         stake_pct = float(prediction.get("stake_pct", 0))
         odds = float(prediction.get("odds") or 0)
+        confidence = float(prediction.get("confidence_pct", 0)) 
         is_correct = v["is_correct"]
         result = "win" if is_correct else "lose"
+
+        if not (1.6 <= odds <= 1.8 and confidence > 70):
+            continue
 
         if stake_pct == 0 or odds == 0:
             continue
