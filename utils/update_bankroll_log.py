@@ -1,7 +1,6 @@
 import uuid
 from utils.supabaseClient import supabase
 
-
 def update_bankroll_log():
     # Fetch all verified predictions
     verifications = supabase.table("verifications").select("*").order("verified_at").execute().data
@@ -34,19 +33,21 @@ def update_bankroll_log():
         if stake_pct == 0 or odds == 0:
             continue
 
+        stake_amount = round((stake_pct / 100) * bankroll, 2)
+
         if is_correct:
-            profit = round(stake_pct * (odds - 1), 2)
+            profit = round(stake_amount * (odds - 1), 2)
         else:
-            profit = round(-stake_pct, 2)
+            profit = round(-stake_amount, 2)
 
         log = {
             "id": str(uuid.uuid4()),
             "prediction_id": prediction_id,
             "date": v["verified_at"].split("T")[0],
-            "stake_amount": stake_pct,
+            "stake_amount": stake_amount,
             "odds": round(odds, 2),
             "result": result,
-            "profit": round(profit, 2),
+            "profit": profit,
             "starting_bankroll": bankroll,
             "bankroll_after": round(bankroll + profit, 2)
         }
