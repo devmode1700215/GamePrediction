@@ -17,7 +17,7 @@ Your job is to predict the following betting market:
 - Calculate the recommended stake using 1/8 of the Kelly criterion:
   - kelly_fraction = ((confidence_decimal × odds - 1) / (odds - 1))
   - stake_pct = max((kelly_fraction / 8) × 100, 0)
-  - Cap stake to 10%
+  - Cap stake to 5%
 - If no bet is recommended, clearly state the reason
 
 📊 Confidence must be calculated from the following weighted system:
