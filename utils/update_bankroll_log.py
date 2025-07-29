@@ -3,8 +3,9 @@ from utils.supabaseClient import supabase
 
 def update_bankroll_log():
     # Fetch all verified predictions
-    verifications = supabase.table("verifications").select("*").order("verified_at").execute().data
+    verifications = supabase.table("verifications").select("*").order("verified_at", desc=True).limit(500).execute().data
 
+    print(f"===Found {len(verifications)} verifications to process.")
     # Fetch existing logs
     existing_logs = supabase.table("bankroll_log").select("*").order("date").execute().data
     logged_ids = {log["prediction_id"] for log in existing_logs}
