@@ -64,12 +64,12 @@ def get_prediction(match_data):
         
         # Make API call with timeout and retry logic
         response = client.chat.completions.create(
-            model="gpt-4-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(match_data)}
             ],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=1000,
             timeout=30.0
         )
