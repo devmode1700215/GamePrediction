@@ -62,47 +62,13 @@ def get_prediction(match_data):
         fixture_id = match_data.get("fixture_id")
         logger.info(f"🤖 Requesting prediction for fixture {fixture_id}")
         
-        # Make API call with timeout and retry logic
+        # Use GPT-5 model
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(match_data)}
             ],
             temperature=0.2,
             max_tokens=1000,
-            timeout=30.0
-        )
-        
-        if not response or not response.choices:
-            logger.error(f"❌ Empty response from OpenAI API for fixture {fixture_id}")
-            return None
-        
-        content = response.choices[0].message.content
-        if not content:
-            logger.error(f"❌ Empty content in API response for fixture {fixture_id}")
-            return None
-        
-        logger.info(f"📝 Raw API response for {fixture_id}: {content[:200]}...")
-        
-        # Parse JSON with better error handling
-        try:
-            prediction_data = json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ JSON decode error for fixture {fixture_id}: {e}")
-            logger.error(f"❌ Raw content: {content}")
-            return None
-        
-        # Validate response structure
-        is_valid, error_msg = validate_prediction_response(prediction_data)
-        if not is_valid:
-            logger.error(f"❌ Invalid prediction response for fixture {fixture_id}: {error_msg}")
-            logger.error(f"❌ Response data: {prediction_data}")
-            return None
-        
-        logger.info(f"✅ Successfully generated prediction for fixture {fixture_id}")
-        return prediction_data
-        
-    except Exception as e:
-        logger.error(f"❌ Unexpected error getting prediction for fixture {fixture_id if 'fixture_id' in locals() else 'unknown'}: {e}")
-        return None
+            t
