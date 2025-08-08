@@ -69,7 +69,7 @@ def get_prediction(match_data):
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(match_data)}
             ],
-            temperature=0.2,
+            temperature=1,
             max_completion_tokens=1000,
             timeout=30.0
         )
