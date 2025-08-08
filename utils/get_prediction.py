@@ -64,7 +64,7 @@ def get_prediction(match_data):
         
         # Use GPT-5 model
         response = client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(match_data)}
