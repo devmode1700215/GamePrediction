@@ -19,10 +19,10 @@ Weighted signals:
 | Recent Form             | 20%    |
 | League Position Gap     | 15%    |
 | Expected Goals (xG)     | 15%    |
-| Recent Goals For/Against| 10%    |
-| Head-to-Head Performance| 10%    |
-| Key Injuries/Suspensions| 20%    |
-| Odds Alignment          | 10%    |
+| Recent Goals For/Against| 20%    |
+| Head-to-Head Performance| 20%    |
+| Key Injuries/Suspensions| 5%    |
+| Odds Alignment          | 5%    |
 
 Ratings:
 - Strong = 1.2× weight
@@ -41,8 +41,8 @@ Output ONLY this raw JSON (no text, no markdown):
       "edge": [decimal],
       "po_value": [true | false],
       "odds": [decimal],
-      "bankroll_pct": [0–10],
-      "rationale": "[short reason: e.g., 'odds outside range' or 'stake exceeds safe threshold']"
+      "bankroll_pct": [0–5],
+      "rationale": "[short reason]"
     }
   }
 }
