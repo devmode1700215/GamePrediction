@@ -67,7 +67,7 @@ def validate_prediction_response(prediction_data):
 
 def get_prediction(match_data):
     """
-    Get prediction from OpenAI with comprehensive error handling.
+    Get prediction from OpenAI with GPT-5-mini compatibility.
     Expects match_data to be a dict including 'fixture_id'.
     Returns dict on success, or None on failure.
     """
@@ -75,8 +75,15 @@ def get_prediction(match_data):
     try:
         logger.info(f"Requesting prediction for fixture {fixture_id}")
 
-        # Compact one-line call to avoid bracket/quote mismatches
-        response = client.chat.completions.create(model="gpt-5-mini", messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(match_data)}], max_completion_tokens=1000, request_timeout=30.0)
+        # GPT-5-mini call — no temperature, use max_completion_tokens
+        response = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(match_data)}
+            ],
+            max_completion_tokens=1000
+        )
 
         if not response or not getattr(response, "choices", None):
             logger.error(f"Empty response from OpenAI API for fixture {fixture_id}")
@@ -112,7 +119,7 @@ def get_prediction(match_data):
         return None
 
 if __name__ == "__main__":
-    # Minimal smoke test to verify syntax and runtime on Render
+    # Minimal smoke test
     dummy_match = {
         "fixture_id": 123456,
         "teams": {"home": "A", "away": "B"},
