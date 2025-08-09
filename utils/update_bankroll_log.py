@@ -32,7 +32,7 @@ def update_bankroll_log():
         is_correct = v["is_correct"]
         result = "win" if is_correct else "lose"
 
-        if not (1.6 <= odds <= 2.3 and confidence > 70):
+        if not (1.6 <= odds <= 2.3 and confidence > 50):
             continue
 
         if stake_pct == 0 or odds == 0:
