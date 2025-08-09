@@ -67,45 +67,45 @@ def validate_prediction_response(prediction_data):
     return True, None
 
 
-def call_model(model_name, match_data):
-    """Call OpenAI model and return parsed JSON or None."""
+def call_gpt4o(match_data):
+    """Call GPT-4o and return parsed JSON or None."""
     try:
         response = client.chat.completions.create(
-            model=model_name,
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(match_data)}
             ],
-            max_completion_tokens=1000  # GPT-5-mini & GPT-4o compatible
+            max_completion_tokens=1000
         )
 
         if not response or not getattr(response, "choices", None):
-            logger.error(f"❌ Empty response from {model_name}")
+            logger.error("❌ Empty response from GPT-4o")
             return None
 
         content = response.choices[0].message.content
         if not content:
-            logger.error(f"❌ Empty content in API response from {model_name}")
+            logger.error("❌ Empty content in API response from GPT-4o")
             return None
 
-        logger.info(f"📝 Raw API response from {model_name}: {content[:200]}...")
+        logger.info(f"📝 Raw API response from GPT-4o: {content[:200]}...")
 
         try:
             prediction_data = json.loads(content)
         except json.JSONDecodeError as e:
-            logger.error(f"❌ JSON decode error from {model_name}: {e}")
+            logger.error(f"❌ JSON decode error from GPT-4o: {e}")
             logger.error(f"Raw content: {content}")
             return None
 
         is_valid, error_msg = validate_prediction_response(prediction_data)
         if not is_valid:
-            logger.error(f"❌ Invalid prediction response from {model_name}: {error_msg}")
+            logger.error(f"❌ Invalid prediction response from GPT-4o: {error_msg}")
             return None
 
         return prediction_data
 
     except Exception as e:
-        logger.error(f"❌ Error calling {model_name}: {e}")
+        logger.error(f"❌ Error calling GPT-4o: {e}")
         return None
 
 
@@ -113,13 +113,7 @@ def get_prediction(match_data):
     fixture_id = match_data.get("fixture_id")
     logger.info(f"🔍 Requesting prediction for fixture {fixture_id}")
 
-    # Try GPT-5-mini first
-    prediction_data = call_model("gpt-5-mini", match_data)
-
-    # Fallback to GPT-4o if GPT-5-mini fails
-    if prediction_data is None:
-        logger.warning(f"⚠️ Falling back to GPT-4o for fixture {fixture_id}")
-        prediction_data = call_model("gpt-4o", match_data)
+    prediction_data = call_gpt4o(match_data)
 
     if prediction_data:
         logger.info(f"✅ Successfully generated prediction for fixture {fixture_id}")
@@ -138,4 +132,3 @@ if __name__ == "__main__":
     }
     result = get_prediction(dummy_match)
     print(json.dumps(result or {"error": "no output"}, ensure_ascii=False))
-    
