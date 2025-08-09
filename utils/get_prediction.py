@@ -25,13 +25,14 @@ try:
         prompt = f.read()
     if not prompt.strip():
         raise ValueError("Prompt file is empty")
-    logger.info("Prompt loaded successfully")
+    logger.info("✅ Prompt loaded successfully")
 except FileNotFoundError:
     logger.error("ERROR: prompt.txt file not found")
     raise
 except Exception as e:
     logger.error(f"ERROR: Failed to load prompt.txt: {e}")
     raise
+
 
 def validate_prediction_response(prediction_data):
     """Validate the structure of prediction response."""
@@ -65,58 +66,68 @@ def validate_prediction_response(prediction_data):
 
     return True, None
 
-def get_prediction(match_data):
-    """
-    Get prediction from OpenAI with GPT-5-mini compatibility.
-    Expects match_data to be a dict including 'fixture_id'.
-    Returns dict on success, or None on failure.
-    """
-    fixture_id = match_data.get("fixture_id")
-    try:
-        logger.info(f"Requesting prediction for fixture {fixture_id}")
 
-        # GPT-5-mini call — no temperature, use max_completion_tokens
+def call_model(model_name, match_data):
+    """Call OpenAI model and return parsed JSON or None."""
+    try:
         response = client.chat.completions.create(
-            model="gpt-5-mini",
+            model=model_name,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(match_data)}
             ],
-            max_completion_tokens=1000
+            max_completion_tokens=1000  # GPT-5-mini & GPT-4o compatible
         )
 
         if not response or not getattr(response, "choices", None):
-            logger.error(f"Empty response from OpenAI API for fixture {fixture_id}")
+            logger.error(f"❌ Empty response from {model_name}")
             return None
 
         content = response.choices[0].message.content
         if not content:
-            logger.error(f"Empty content in API response for fixture {fixture_id}")
+            logger.error(f"❌ Empty content in API response from {model_name}")
             return None
 
-        logger.info(f"Raw API response for {fixture_id}: {content[:200]}...")
+        logger.info(f"📝 Raw API response from {model_name}: {content[:200]}...")
 
-        # Parse JSON safely
         try:
             prediction_data = json.loads(content)
         except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error for fixture {fixture_id}: {e}")
+            logger.error(f"❌ JSON decode error from {model_name}: {e}")
             logger.error(f"Raw content: {content}")
             return None
 
-        # Validate structure
         is_valid, error_msg = validate_prediction_response(prediction_data)
         if not is_valid:
-            logger.error(f"Invalid prediction response for fixture {fixture_id}: {error_msg}")
-            logger.error(f"Response data: {prediction_data}")
+            logger.error(f"❌ Invalid prediction response from {model_name}: {error_msg}")
             return None
 
-        logger.info(f"Successfully generated prediction for fixture {fixture_id}")
         return prediction_data
 
     except Exception as e:
-        logger.error(f"Unexpected error getting prediction for fixture {fixture_id if fixture_id else 'unknown'}: {e}")
+        logger.error(f"❌ Error calling {model_name}: {e}")
         return None
+
+
+def get_prediction(match_data):
+    fixture_id = match_data.get("fixture_id")
+    logger.info(f"🔍 Requesting prediction for fixture {fixture_id}")
+
+    # Try GPT-5-mini first
+    prediction_data = call_model("gpt-5-mini", match_data)
+
+    # Fallback to GPT-4o if GPT-5-mini fails
+    if prediction_data is None:
+        logger.warning(f"⚠️ Falling back to GPT-4o for fixture {fixture_id}")
+        prediction_data = call_model("gpt-4o", match_data)
+
+    if prediction_data:
+        logger.info(f"✅ Successfully generated prediction for fixture {fixture_id}")
+    else:
+        logger.error(f"❌ Failed to get prediction for fixture {fixture_id}")
+
+    return prediction_data
+
 
 if __name__ == "__main__":
     # Minimal smoke test
