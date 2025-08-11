@@ -1,63 +1,62 @@
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from utils.supabaseClient import supabase
 
+# Tunables
+WINDOW_HOURS = 36          # 24h + buffer for late results
+BATCH_SIZE = 500
 
 def get_matches_needing_results():
-    now_iso = datetime.utcnow().isoformat()
-    
-    # Fetch all matches in chunks
-    all_matches = []
-    offset = 0
-    limit = 500
-    
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=WINDOW_HOURS)
+    start_iso = window_start.isoformat(timespec="seconds")
+    end_iso = now.isoformat(timespec="seconds")
+
+    # keyset over 'date' ASC within the window
+    last_seen = None
+    needing = []
+
     while True:
-        response = supabase.table("matches").select("*").lt("date", now_iso).range(offset, offset + limit - 1).execute()
-        chunk_matches = response.data
-        
-        if not chunk_matches:  # No more data
-            break
-            
-        all_matches.extend(chunk_matches)
-        
-        # If we got less than the limit, we've reached the end
-        if len(chunk_matches) < limit:
-            break
-            
-        offset += limit
+        q = (
+            supabase.table("matches")
+            .select("fixture_id,date,status")          # only what you need
+            .gte("date", start_iso)
+            .lt("date", end_iso)
+            .order("date", asc=True)
+            .limit(BATCH_SIZE)
+        )
+        if last_seen:
+            q = q.gt("date", last_seen)               # keyset step
 
-    print(f"Total matches fetched: {len(all_matches)}")
-
-    # Filter out ones that already exist in results (with pagination)
-    all_results = []
-    offset = 0
-    limit = 500
-    
-    while True:
-        response = supabase.table("results").select("fixture_id").range(offset, offset + limit - 1).execute()
-        chunk_results = response.data
-        
-        if not chunk_results:  # No more data
+        chunk = q.execute().data or []
+        if not chunk:
             break
-            
-        all_results.extend(chunk_results)
-        
-        # If we got less than the limit, we've reached the end
-        if len(chunk_results) < limit:
-            break
-            
-        offset += limit
 
-    print(f"Total results fetched: {len(all_results)}")
-    completed_ids = {r["fixture_id"] for r in all_results}
+        # collect fixture_ids
+        ids = [m["fixture_id"] for m in chunk if m.get("fixture_id")]
+        if not ids:
+            last_seen = chunk[-1]["date"]
+            continue
 
-    filtered_matches = [m for m in all_matches if m["fixture_id"] not in completed_ids]
-    print(f"Matches needing results: {len(filtered_matches)}")
-    
-    return filtered_matches
+        # fetch only results for this batch of fixtures
+        res = (
+            supabase.table("results")
+            .select("fixture_id")
+            .in_("fixture_id", ids)
+            .execute()
+            .data
+            or []
+        )
+        done_ids = {r["fixture_id"] for r in res}
+
+        # keep matches that don't have results yet
+        for m in chunk:
+            if m["fixture_id"] not in done_ids:
+                needing.append(m)
+
+        last_seen = chunk[-1]["date"]
+
+    return needing
 
 if __name__ == "__main__":
-    matches = get_matches_needing_results()
-    print(len(matches))
+    missing = get_matches_needing_results()
+    print(f"Matches needing results in last {WINDOW_HOURS}h: {len(missing)}")
