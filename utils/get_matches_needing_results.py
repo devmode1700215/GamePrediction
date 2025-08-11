@@ -8,8 +8,8 @@ BATCH_SIZE = 500
 def get_matches_needing_results():
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=WINDOW_HOURS)
-    start_iso = window_start.isoformat(timespec="seconds")
-    end_iso = now.isoformat(timespec="seconds")
+    start_iso = window_start.isoformat(timespec="seconds").replace("+00:00", "Z")
+    end_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
     # keyset over 'date' ASC within the window
     last_seen = None
@@ -21,7 +21,7 @@ def get_matches_needing_results():
             .select("fixture_id,date,status")          # only what you need
             .gte("date", start_iso)
             .lt("date", end_iso)
-            .order("date", asc=True)
+            .order("date", desc=False)                 # ASC (correct signature)
             .limit(BATCH_SIZE)
         )
         if last_seen:
