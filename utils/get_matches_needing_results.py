@@ -18,7 +18,7 @@ def get_matches_needing_results():
     while True:
         q = (
             supabase.table("matches")
-            .select("fixture_id,date,status")          # only what you need
+            .select("fixture_id,date")          # only what you need
             .gte("date", start_iso)
             .lt("date", end_iso)
             .order("date", desc=False)                 # ASC (correct signature)
