@@ -10,6 +10,8 @@ API_KEY = os.getenv("FOOTBALL_API_KEY")
 HEADERS = {"x-apisports-key": API_KEY}
 
 
+from datetime import datetime, timedelta, timezone
+
 def fetch_fixtures(from_date, to_date):
     """
     Fetch fixtures between from_date and to_date (YYYY-MM-DD format).
@@ -19,7 +21,7 @@ def fetch_fixtures(from_date, to_date):
     try:
         current_date = datetime.strptime(from_date, "%Y-%m-%d")
         end_date = datetime.strptime(to_date, "%Y-%m-%d")
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(timezone.utc)  # Make aware
 
         while current_date <= end_date:
             date_str = current_date.strftime("%Y-%m-%d")
@@ -29,9 +31,12 @@ def fetch_fixtures(from_date, to_date):
             if resp.status_code == 200:
                 day_fixtures = resp.json().get("response", [])
 
-                # Only keep upcoming matches (not finished or already started long ago)
                 for match in day_fixtures:
-                    fixture_date = datetime.fromisoformat(match["fixture"]["date"].replace("Z", "+00:00"))
+                    fixture_date = datetime.fromisoformat(
+                        match["fixture"]["date"].replace("Z", "+00:00")
+                    )  # This is aware
+
+                    # Compare only aware datetimes
                     if fixture_date >= now_utc:
                         fixtures.append(match)
 
