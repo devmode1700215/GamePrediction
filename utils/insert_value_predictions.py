@@ -3,8 +3,13 @@
 from typing import Dict, Any
 from utils.supabaseClient import supabase
 
-# Only keep an odds range gate (you asked to remove confidence filters)
-ODDS_MIN, ODDS_MAX = 1.6, 2.3  # acceptable odds range
+# Odds range gate (confidence gate intentionally removed)
+ODDS_MIN, ODDS_MAX = 1.6, 2.3
+
+# If you have a unique constraint on (fixture_id, market),
+# you can use UPSERT to avoid duplicates. Otherwise set to False.
+USE_UPSERT = True
+ON_CONFLICT_COLUMNS = "fixture_id,market"
 
 
 def _to_float(x):
@@ -27,7 +32,7 @@ def _to_bool_true(x):
     if isinstance(x, (int, float)):
         return x == 1
     if isinstance(x, str):
-        return x.strip().lower() in ("true", "1", "yes")
+        return x.strip().lower() in ("true", "1", "yes", "y")
     return False
 
 
@@ -55,6 +60,8 @@ def insert_value_predictions(prediction_data: Dict[str, Any]) -> int:
         # confidence is optional now; we still store it if present
         confidence = _to_float(details.get("confidence"))
         po_value = _to_bool_true(details.get("po_value"))
+        stake_pct = _to_float(details.get("bankroll_pct"))
+        edge = _to_float(details.get("edge"))
 
         # ---- Gates (confidence removed) ----
         if odds is None:
@@ -71,17 +78,22 @@ def insert_value_predictions(prediction_data: Dict[str, Any]) -> int:
             "fixture_id": fixture_id,
             "market": market,
             "prediction": details.get("prediction"),
-            # store confidence if available, else None (assuming column allows NULL)
-            "confidence_pct": confidence,
+            "confidence_pct": confidence,  # can be None if absent
             "po_value": True,
-            "stake_pct": _to_float(details.get("bankroll_pct")),
-            "edge": _to_float(details.get("edge")),
+            "stake_pct": stake_pct,
+            "edge": edge,
             "odds": odds,
             "rationale": details.get("rationale"),
         }
 
         try:
-            supabase.table("value_predictions").insert(entry).execute()
+            if USE_UPSERT:
+                supabase.table("value_predictions") \
+                    .upsert(entry, on_conflict=ON_CONFLICT_COLUMNS) \
+                    .execute()
+            else:
+                supabase.table("value_predictions").insert(entry).execute()
+
             inserted_count += 1
             print(f"✅ INSERTED {fixture_id} | {market} | odds={odds} conf={confidence}")
         except Exception as e:
