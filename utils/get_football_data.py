@@ -65,18 +65,90 @@ def get_head_to_head(home_id, away_id):
         return []
 
 
+# utils/get_football_data.py
 def get_match_odds(fixture_id):
+    """
+    Returns a flat dict of odds with keys we use downstream.
+    Falls back across bookmakers/markets and returns None if nothing usable.
+    """
     try:
         url = f"{API_BASE}/odds?fixture={fixture_id}"
         resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 200:
-            return resp.json().get("response", [])
-        else:
+        if resp.status_code != 200:
             print(f"⚠️ Failed to fetch odds for fixture {fixture_id}: {resp.status_code}")
-            return []
+            return None
+
+        data = resp.json().get("response", [])
+        if not data:
+            return None
+
+        # Preferred bookmakers first, then fallback to any
+        preferred_books = {"Bwin", "Bet365", "William Hill", "Unibet"}
+
+        def flatten_from_bookmaker(bookmaker_obj):
+            out = {
+                "home_win": None, "draw": None, "away_win": None,
+                "btts_yes": None, "btts_no": None,
+                "over_2_5": None, "under_2_5": None,
+            }
+            for bet in bookmaker_obj.get("bets", []):
+                name = (bet.get("name") or "").lower()
+                for val in bet.get("values", []) or []:
+                    vlabel = (val.get("value") or "").strip()
+                    odd_str = val.get("odd")
+                    try:
+                        odd = float(odd_str) if odd_str is not None else None
+                    except (TypeError, ValueError):
+                        odd = None
+
+                    if name in ("match winner", "1x2"):
+                        if vlabel.lower() in ("home", "1"):
+                            out["home_win"] = odd
+                        elif vlabel.lower() in ("draw", "x"):
+                            out["draw"] = odd
+                        elif vlabel.lower() in ("away", "2"):
+                            out["away_win"] = odd
+
+                    elif name in ("goals over/under", "over/under"):
+                        if vlabel.lower() in ("over 2.5", "over 2,5"):
+                            out["over_2_5"] = odd
+                        elif vlabel.lower() in ("under 2.5", "under 2,5"):
+                            out["under_2_5"] = odd
+
+                    elif name in ("both teams to score", "btts", "both teams score"):
+                        if vlabel.lower() == "yes":
+                            out["btts_yes"] = odd
+                        elif vlabel.lower() == "no":
+                            out["btts_no"] = odd
+
+            # If literally all None, treat as unusable
+            return out if any(v is not None for v in out.values()) else None
+
+        # API structure: response -> [ { bookmakers: [...] } ] (varies by provider)
+        # Some providers wrap further; normalize a list of bookmaker blocks:
+        bookmaker_blocks = []
+        for item in data:
+            for bm in item.get("bookmakers", []):
+                bookmaker_blocks.append(bm)
+
+        # Try preferred books first
+        for bm in bookmaker_blocks:
+            if bm.get("name") in preferred_books:
+                flat = flatten_from_bookmaker(bm)
+                if flat:
+                    return flat
+
+        # Fallback: first bookmaker that yields anything
+        for bm in bookmaker_blocks:
+            flat = flatten_from_bookmaker(bm)
+            if flat:
+                return flat
+
+        return None
+
     except Exception as e:
         print(f"❌ Error in get_match_odds: {e}")
-        return []
+        return None
 
 
 def get_recent_goals(team_id):
