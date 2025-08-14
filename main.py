@@ -4,12 +4,20 @@ import sys
 from utils.get_prediction import get_prediction
 from utils.insert_value_predictions import insert_value_predictions
 from utils.fetch_and_store_result import fetch_and_store_result
-from utils.get_football_data import fetch_fixtures, get_head_to_head, get_match_odds, get_recent_goals, get_team_form_and_goals, get_team_injuries, get_team_position
+from utils.get_football_data import (
+    fetch_fixtures_next_48h,
+    get_head_to_head,
+    get_match_odds,
+    get_recent_goals,
+    get_team_form_and_goals,
+    get_team_injuries,
+    get_team_position
+)
 from utils.insert_match import insert_match
 from utils.get_matches_needing_results import get_matches_needing_results
 from utils.supabaseClient import supabase
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -60,6 +68,7 @@ def safe_extract_match_data(match):
 
 
 def update_results_for_finished_matches():
+    """Update results for matches that need them"""
     try:
         matches = get_matches_needing_results()
         if not matches:
@@ -74,6 +83,7 @@ def update_results_for_finished_matches():
 
 
 def save_prediction_json(prediction_data, filename="predictions.json"):
+    """Save prediction data locally for debugging"""
     try:
         with open(filename, "a", encoding="utf-8") as f:
             f.write(json.dumps(prediction_data) + "\n")
@@ -86,11 +96,8 @@ def main():
         logger.info("🚀 Starting football prediction system...")
         update_results_for_finished_matches()
 
-        now = datetime.utcnow()
-        end = now + timedelta(hours=48)
-
-        logger.info(f"📅 Fetching fixtures from {now} to {end}")
-        fixtures = fetch_fixtures(from_date=now.strftime("%Y-%m-%d"), to_date=end.strftime("%Y-%m-%d"))
+        logger.info("📅 Fetching fixtures for the next 48 hours...")
+        fixtures = fetch_fixtures_next_48h()
 
         if not isinstance(fixtures, list):
             logger.error("❌ Fixtures is not an array")
