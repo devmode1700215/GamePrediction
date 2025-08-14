@@ -1,103 +1,80 @@
 # utils/insert_value_predictions.py
-
 from typing import Dict, Any
 from utils.supabaseClient import supabase
 
-# Odds range gate (confidence gate intentionally removed)
 ODDS_MIN, ODDS_MAX = 1.6, 2.3
 
-# If you have a unique constraint on (fixture_id, market),
-# you can use UPSERT to avoid duplicates. Otherwise set to False.
-USE_UPSERT = True
-ON_CONFLICT_COLUMNS = "fixture_id,market"
-
-
 def _to_float(x):
-    """Convert strings like '1.85' or '70%' to float when possible."""
-    if isinstance(x, (int, float)):
+    try:
         return float(x)
-    if isinstance(x, str):
-        s = x.strip().replace("%", "")
-        try:
-            return float(s)
-        except ValueError:
-            return None
-    return None
-
-
-def _to_bool_true(x):
-    """Interpret various truthy values as True."""
-    if isinstance(x, bool):
-        return x
-    if isinstance(x, (int, float)):
-        return x == 1
-    if isinstance(x, str):
-        return x.strip().lower() in ("true", "1", "yes", "y")
-    return False
-
+    except (TypeError, ValueError):
+        return None
 
 def insert_value_predictions(prediction_data: Dict[str, Any]) -> int:
     """
-    Insert markets from prediction_data into Supabase table value_predictions.
-    Confidence filters are REMOVED per request.
-    Still enforces odds range and po_value flag.
-    Returns number of markets inserted.
+    Insert/Upsert value predictions for a single fixture.
+    Filters:
+      - odds between ODDS_MIN and ODDS_MAX
+      - po_value == True
+    Returns the number of rows successfully written.
     """
     fixture_id = prediction_data.get("fixture_id")
-    predictions = prediction_data.get("predictions", {}) or {}
-    inserted_count = 0
+    predictions = (prediction_data.get("predictions") or {})
 
+    if not fixture_id:
+        print("❌ insert_value_predictions: missing fixture_id")
+        return 0
     if not isinstance(predictions, dict) or not predictions:
-        print(f"ℹ️ No valid prediction markets for fixture {fixture_id}")
+        print(f"ℹ️ insert_value_predictions: no predictions object for fixture {fixture_id}")
         return 0
 
+    to_write = []
     for market, details in predictions.items():
         if not isinstance(details, dict):
-            print(f"⚠️ Invalid prediction format for {fixture_id} | {market}: {details}")
+            print(f"⚠️ skipping market {market}: not a dict")
             continue
 
+        # Odds filter
         odds = _to_float(details.get("odds"))
-        # confidence is optional now; we still store it if present
-        confidence = _to_float(details.get("confidence"))
-        po_value = _to_bool_true(details.get("po_value"))
-        stake_pct = _to_float(details.get("bankroll_pct"))
-        edge = _to_float(details.get("edge"))
-
-        # ---- Gates (confidence removed) ----
         if odds is None:
-            print(f"⛔ SKIP {fixture_id} | {market}: odds missing or invalid ({details.get('odds')!r})")
+            print(f"⚠️ skipping {fixture_id} | {market}: odds is None/invalid")
             continue
         if not (ODDS_MIN <= odds <= ODDS_MAX):
-            print(f"⛔ SKIP {fixture_id} | {market}: odds {odds} outside range {ODDS_MIN}-{ODDS_MAX}")
+            print(f"⚠️ skipping {fixture_id} | {market}: odds {odds} outside [{ODDS_MIN},{ODDS_MAX}]")
             continue
-        if not po_value:
-            print(f"⛔ SKIP {fixture_id} | {market}: po_value is not true ({details.get('po_value')!r})")
+
+        # PO filter
+        po_value = details.get("po_value")
+        if po_value is not True:
+            print(f"⚠️ skipping {fixture_id} | {market}: po_value is {po_value} (needs to be True)")
             continue
 
         entry = {
             "fixture_id": fixture_id,
             "market": market,
             "prediction": details.get("prediction"),
-            "confidence_pct": confidence,  # can be None if absent
+            "confidence_pct": _to_float(details.get("confidence")),
             "po_value": True,
-            "stake_pct": stake_pct,
-            "edge": edge,
+            "stake_pct": _to_float(details.get("bankroll_pct")),
+            "edge": _to_float(details.get("edge")),
             "odds": odds,
             "rationale": details.get("rationale"),
         }
+        to_write.append(entry)
 
-        try:
-            if USE_UPSERT:
-                supabase.table("value_predictions") \
-                    .upsert(entry, on_conflict=ON_CONFLICT_COLUMNS) \
-                    .execute()
-            else:
-                supabase.table("value_predictions").insert(entry).execute()
+    if not to_write:
+        print(f"ℹ️ insert_value_predictions: nothing to insert for fixture {fixture_id}")
+        return 0
 
-            inserted_count += 1
-            print(f"✅ INSERTED {fixture_id} | {market} | odds={odds} conf={confidence}")
-        except Exception as e:
-            print(f"❌ FAILED insert for {fixture_id} | {market}: {e}")
-
-    print(f"📦 Fixture {fixture_id}: inserted {inserted_count} market(s)")
-    return inserted_count
+    try:
+        resp = supabase.table("value_predictions") \
+            .upsert(to_write, on_conflict="fixture_id,market") \
+            .execute()
+        written = len(resp.data or [])
+        print(f"✅ value_predictions upsert OK: wrote {written}/{len(to_write)} for fixture {fixture_id}")
+        if written < len(to_write):
+            print(f"ℹ️ upsert returned fewer rows than attempted; check unique constraint or RLS.")
+        return written
+    except Exception as e:
+        print(f"❌ value_predictions upsert failed for fixture {fixture_id}: {e}")
+        return 0
