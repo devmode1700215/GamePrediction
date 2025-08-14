@@ -3,13 +3,12 @@
 from typing import Dict, Any
 from utils.supabaseClient import supabase
 
-# Thresholds for inserting predictions
-CONF_MIN = 70.0  # percent
+# Only keep an odds range gate (you asked to remove confidence filters)
 ODDS_MIN, ODDS_MAX = 1.6, 2.3  # acceptable odds range
 
 
 def _to_float(x):
-    """Convert odds/confidence strings like '1.85' or '70%' to float."""
+    """Convert strings like '1.85' or '70%' to float when possible."""
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, str):
@@ -34,8 +33,9 @@ def _to_bool_true(x):
 
 def insert_value_predictions(prediction_data: Dict[str, Any]) -> int:
     """
-    Insert markets from prediction_data into Supabase table value_predictions
-    if they pass confidence, odds, and po_value checks.
+    Insert markets from prediction_data into Supabase table value_predictions.
+    Confidence filters are REMOVED per request.
+    Still enforces odds range and po_value flag.
     Returns number of markets inserted.
     """
     fixture_id = prediction_data.get("fixture_id")
@@ -52,31 +52,26 @@ def insert_value_predictions(prediction_data: Dict[str, Any]) -> int:
             continue
 
         odds = _to_float(details.get("odds"))
+        # confidence is optional now; we still store it if present
         confidence = _to_float(details.get("confidence"))
         po_value = _to_bool_true(details.get("po_value"))
 
-        # Detailed skip logs
+        # ---- Gates (confidence removed) ----
         if odds is None:
             print(f"⛔ SKIP {fixture_id} | {market}: odds missing or invalid ({details.get('odds')!r})")
             continue
         if not (ODDS_MIN <= odds <= ODDS_MAX):
             print(f"⛔ SKIP {fixture_id} | {market}: odds {odds} outside range {ODDS_MIN}-{ODDS_MAX}")
             continue
-        if confidence is None:
-            print(f"⛔ SKIP {fixture_id} | {market}: confidence missing or invalid ({details.get('confidence')!r})")
-            continue
-        if confidence < CONF_MIN:
-            print(f"⛔ SKIP {fixture_id} | {market}: confidence {confidence} < min {CONF_MIN}")
-            continue
         if not po_value:
             print(f"⛔ SKIP {fixture_id} | {market}: po_value is not true ({details.get('po_value')!r})")
             continue
 
-        # Build entry
         entry = {
             "fixture_id": fixture_id,
             "market": market,
             "prediction": details.get("prediction"),
+            # store confidence if available, else None (assuming column allows NULL)
             "confidence_pct": confidence,
             "po_value": True,
             "stake_pct": _to_float(details.get("bankroll_pct")),
