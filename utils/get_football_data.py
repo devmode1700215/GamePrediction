@@ -1,215 +1,269 @@
+# utils/get_football_data.py
 import os
-import requests
-from datetime import datetime, timedelta
+import time
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
 from dotenv import load_dotenv
+from utils.safe_get import safe_get
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-API_BASE = "https://v3.football.api-sports.io"
 API_KEY = os.getenv("FOOTBALL_API_KEY")
+BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 
+# ---- general helpers ---------------------------------------------------------
 
-from datetime import datetime, timedelta, timezone
+def _retry_get(url: str, headers: Dict[str, str], max_retries: int = 3, backoff_sec: float = 1.5):
+    """
+    Call safe_get with small exponential backoff for common transient errors.
+    Returns a requests.Response or None.
+    """
+    for attempt in range(1, max_retries + 1):
+        resp = safe_get(url, headers=headers)
+        if resp is None:
+            # network error already logged by safe_get
+            time.sleep(backoff_sec * attempt)
+            continue
 
-def fetch_fixtures(from_date, to_date):
-    """
-    Fetch fixtures between from_date and to_date (YYYY-MM-DD format).
-    Includes matches starting from now and up to the specified to_date.
-    """
-    fixtures = []
+        # API-Sports returns 200/4xx/5xx; on 429/403 we back off once/twice
+        if resp.status_code in (429, 403, 500, 502, 503, 504):
+            try:
+                msg = resp.json()
+            except Exception:
+                msg = resp.text
+            logger.warning(f"⚠️ API {resp.status_code} for {url} (attempt {attempt}/{max_retries}): {msg}")
+            time.sleep(backoff_sec * attempt)
+            continue
+
+        return resp
+
+    return None
+
+def _to_float(x):
     try:
-        current_date = datetime.strptime(from_date, "%Y-%m-%d")
-        end_date = datetime.strptime(to_date, "%Y-%m-%d")
-        now_utc = datetime.now(timezone.utc)  # Make aware
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
-        while current_date <= end_date:
-            date_str = current_date.strftime("%Y-%m-%d")
-            url = f"{API_BASE}/fixtures?date={date_str}"
-            resp = requests.get(url, headers=HEADERS, timeout=30)
+# ---- fixtures ---------------------------------------------------------------
 
-            if resp.status_code == 200:
-                day_fixtures = resp.json().get("response", [])
+def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
+    """
+    Fetch fixtures for a single calendar date (YYYY-MM-DD).
+    Returns an array (possibly empty). Never raises.
+    """
+    url = f"{BASE_URL}/fixtures?date={date_str}"
+    resp = _retry_get(url, headers=HEADERS)
+    if resp is None:
+        logger.warning(f"⚠️ Failed to fetch fixtures for {date_str}")
+        return []
+    try:
+        data = resp.json()
+        return data.get("response", []) or []
+    except Exception as e:
+        logger.error(f"❌ Error parsing fixtures for {date_str}: {e}")
+        return []
 
-                for match in day_fixtures:
-                    fixture_date = datetime.fromisoformat(
-                        match["fixture"]["date"].replace("Z", "+00:00")
-                    )  # This is aware
+# ---- standings / team stats -------------------------------------------------
 
-                    # Compare only aware datetimes
-                    if fixture_date >= now_utc:
-                        fixtures.append(match)
+def get_team_position(team_id: Optional[int], league_id: Optional[int], season: Optional[int]) -> Optional[int]:
+    if not (team_id and league_id and season):
+        return None
+    url = f"{BASE_URL}/standings?league={league_id}&season={season}"
+    resp = _retry_get(url, headers=HEADERS)
+    if resp is None:
+        return None
+    try:
+        payload = resp.json().get("response", [])
+        if not payload:
+            return None
+        standings_blocks = payload[0].get("league", {}).get("standings", [])
+        if not standings_blocks:
+            return None
+        for row in standings_blocks[0]:
+            t = (row or {}).get("team", {}) or {}
+            if t.get("id") == team_id:
+                return row.get("rank")
+        return None
+    except Exception:
+        return None
 
+def get_team_form_and_goals(team_id: Optional[int], league_id: Optional[int], season: Optional[int]) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Returns (form_string like 'W-W-D-L-W', xg_for_total_avg) if available.
+    """
+    if not (team_id and league_id and season):
+        return None, None
+    url = f"{BASE_URL}/teams/statistics?team={team_id}&league={league_id}&season={season}"
+    resp = _retry_get(url, headers=HEADERS)
+    if resp is None:
+        return None, None
+    try:
+        stats = resp.json().get("response", {}) or {}
+        form_raw = stats.get("form") or ""
+        form = "-".join(list(form_raw)) if form_raw else None
+
+        expected = stats.get("expected", {}) or {}
+        goals_for = (expected.get("goals", {}) or {}).get("for", {}) or {}
+        average = goals_for.get("average", {}) or {}
+        xg = average.get("total")
+        xg = _to_float(xg)
+        return form, xg
+    except Exception:
+        return None, None
+
+def get_recent_goals(team_id: Optional[int]) -> List[int]:
+    """
+    Returns a list of the team's goals scored in each of their last 5 matches.
+    """
+    if not team_id:
+        return []
+    url = f"{BASE_URL}/fixtures?team={team_id}&last=5"
+    resp = _retry_get(url, headers=HEADERS)
+    if resp is None:
+        return []
+    try:
+        matches = resp.json().get("response", []) or []
+        out = []
+        for m in matches:
+            goals = (m.get("goals") or {})
+            teams = (m.get("teams") or {})
+            home = (teams.get("home") or {})
+            if home.get("id") == team_id:
+                out.append(int(goals.get("home") or 0))
             else:
-                print(f"⚠️ Failed to fetch fixtures for {date_str}: {resp.status_code}")
-
-            current_date += timedelta(days=1)
-
-    except Exception as e:
-        print(f"❌ Error in fetch_fixtures: {e}")
-
-    return fixtures
-
-
-def get_head_to_head(home_id, away_id):
-    try:
-        url = f"{API_BASE}/fixtures/headtohead?h2h={home_id}-{away_id}"
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 200:
-            return resp.json().get("response", [])
-        else:
-            print(f"⚠️ Failed to fetch head-to-head: {resp.status_code}")
-            return []
-    except Exception as e:
-        print(f"❌ Error in get_head_to_head: {e}")
+                out.append(int(goals.get("away") or 0))
+        return out
+    except Exception:
         return []
 
+# ---- match odds -------------------------------------------------------------
 
-# utils/get_football_data.py
-def get_match_odds(fixture_id):
+_ODDS_KEYS = ["home_win", "draw", "away_win", "btts_yes", "btts_no", "over_2_5", "under_2_5"]
+
+def _empty_odds_dict():
+    return {k: None for k in _ODDS_KEYS}
+
+def get_match_odds(fixture_id: Optional[int]) -> Dict[str, Optional[float]]:
     """
-    Returns a flat dict of odds with keys we use downstream.
-    Falls back across bookmakers/markets and returns None if nothing usable.
+    Returns a flat odds dict with the keys above, or all None if unavailable.
+    Prefers Bwin; falls back to first bookmaker that has the markets.
     """
+    out = _empty_odds_dict()
+    if not fixture_id:
+        return out
+
+    url = f"{BASE_URL}/odds?fixture={fixture_id}"
+    resp = _retry_get(url, headers=HEADERS)
+    if resp is None:
+        return out
+
     try:
-        url = f"{API_BASE}/odds?fixture={fixture_id}"
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code != 200:
-            print(f"⚠️ Failed to fetch odds for fixture {fixture_id}: {resp.status_code}")
-            return None
+        events = resp.json().get("response", []) or []
+        if not events:
+            return out
 
-        data = resp.json().get("response", [])
-        if not data:
-            return None
+        # Choose preferred bookmaker (Bwin) if available; otherwise first bookmaker
+        chosen = None
+        for ev in events:
+            for book in (ev.get("bookmakers") or []):
+                if (book.get("name") or "").lower() == "bwin":
+                    chosen = book
+                    break
+            if chosen:
+                break
+        if chosen is None:
+            # fallback: first bookmaker found
+            for ev in events:
+                arr = ev.get("bookmakers") or []
+                if arr:
+                    chosen = arr[0]
+                    break
+        if chosen is None:
+            return out
 
-        # Preferred bookmakers first, then fallback to any
-        preferred_books = {"Bwin", "Bet365", "William Hill", "Unibet"}
+        # Parse bets / markets
+        for bet in (chosen.get("bets") or []):
+            name = (bet.get("name") or "").lower()
 
-        def flatten_from_bookmaker(bookmaker_obj):
-            out = {
-                "home_win": None, "draw": None, "away_win": None,
-                "btts_yes": None, "btts_no": None,
-                "over_2_5": None, "under_2_5": None,
-            }
-            for bet in bookmaker_obj.get("bets", []):
-                name = (bet.get("name") or "").lower()
-                for val in bet.get("values", []) or []:
-                    vlabel = (val.get("value") or "").strip()
-                    odd_str = val.get("odd")
-                    try:
-                        odd = float(odd_str) if odd_str is not None else None
-                    except (TypeError, ValueError):
-                        odd = None
+            if name in ("match winner", "1x2", "winner"):
+                for v in (bet.get("values") or []):
+                    val = (v.get("value") or "").lower()
+                    odd = _to_float(v.get("odd"))
+                    if val == "home":
+                        out["home_win"] = odd
+                    elif val == "draw":
+                        out["draw"] = odd
+                    elif val == "away":
+                        out["away_win"] = odd
 
-                    if name in ("match winner", "1x2"):
-                        if vlabel.lower() in ("home", "1"):
-                            out["home_win"] = odd
-                        elif vlabel.lower() in ("draw", "x"):
-                            out["draw"] = odd
-                        elif vlabel.lower() in ("away", "2"):
-                            out["away_win"] = odd
+            elif name in ("goals over/under", "over/under"):
+                for v in (bet.get("values") or []):
+                    val = (v.get("value") or "").lower().replace(" ", "")
+                    odd = _to_float(v.get("odd"))
+                    if val in ("over2.5", "over2,5"):
+                        out["over_2_5"] = odd
+                    elif val in ("under2.5", "under2,5"):
+                        out["under_2_5"] = odd
 
-                    elif name in ("goals over/under", "over/under"):
-                        if vlabel.lower() in ("over 2.5", "over 2,5"):
-                            out["over_2_5"] = odd
-                        elif vlabel.lower() in ("under 2.5", "under 2,5"):
-                            out["under_2_5"] = odd
+            elif name in ("both teams to score", "btts", "both teams score"):
+                for v in (bet.get("values") or []):
+                    val = (v.get("value") or "").lower()
+                    odd = _to_float(v.get("odd"))
+                    if val == "yes":
+                        out["btts_yes"] = odd
+                    elif val == "no":
+                        out["btts_no"] = odd
 
-                    elif name in ("both teams to score", "btts", "both teams score"):
-                        if vlabel.lower() == "yes":
-                            out["btts_yes"] = odd
-                        elif vlabel.lower() == "no":
-                            out["btts_no"] = odd
+        return out
+    except Exception:
+        return out
 
-            # If literally all None, treat as unusable
-            return out if any(v is not None for v in out.values()) else None
+# ---- head to head -----------------------------------------------------------
 
-        # API structure: response -> [ { bookmakers: [...] } ] (varies by provider)
-        # Some providers wrap further; normalize a list of bookmaker blocks:
-        bookmaker_blocks = []
-        for item in data:
-            for bm in item.get("bookmakers", []):
-                bookmaker_blocks.append(bm)
-
-        # Try preferred books first
-        for bm in bookmaker_blocks:
-            if bm.get("name") in preferred_books:
-                flat = flatten_from_bookmaker(bm)
-                if flat:
-                    return flat
-
-        # Fallback: first bookmaker that yields anything
-        for bm in bookmaker_blocks:
-            flat = flatten_from_bookmaker(bm)
-            if flat:
-                return flat
-
-        return None
-
-    except Exception as e:
-        print(f"❌ Error in get_match_odds: {e}")
-        return None
-
-
-def get_recent_goals(team_id):
+def get_head_to_head(home_id: Optional[int], away_id: Optional[int]) -> List[Dict[str, Any]]:
+    if not (home_id and away_id):
+        return []
+    url = f"{BASE_URL}/fixtures/headtohead?h2h={home_id}-{away_id}"
+    resp = _retry_get(url, headers=HEADERS)
+    if resp is None:
+        return []
     try:
-        url = f"{API_BASE}/teams/statistics?team={team_id}"
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 200:
-            return resp.json().get("response", {})
-        else:
-            print(f"⚠️ Failed to fetch recent goals for team {team_id}: {resp.status_code}")
-            return {}
-    except Exception as e:
-        print(f"❌ Error in get_recent_goals: {e}")
-        return {}
-
-
-def get_team_form_and_goals(team_id, league_id, season):
-    try:
-        url = f"{API_BASE}/teams/statistics?team={team_id}&league={league_id}&season={season}"
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json().get("response", {})
-            form = data.get("form", "")
-            xg = data.get("expected", {}).get("goals", {}).get("total", 0)
-            return form, xg
-        else:
-            print(f"⚠️ Failed to fetch form/XG for team {team_id}: {resp.status_code}")
-            return "", 0
-    except Exception as e:
-        print(f"❌ Error in get_team_form_and_goals: {e}")
-        return "", 0
-
-
-def get_team_injuries(team_id, season):
-    try:
-        url = f"{API_BASE}/injuries?team={team_id}&season={season}"
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 200:
-            return resp.json().get("response", [])
-        else:
-            print(f"⚠️ Failed to fetch injuries for team {team_id}: {resp.status_code}")
-            return []
-    except Exception as e:
-        print(f"❌ Error in get_team_injuries: {e}")
+        matches = resp.json().get("response", [])[:3]  # last 3
+        out = []
+        for m in matches:
+            out.append({
+                "date": (m.get("fixture") or {}).get("date"),
+                "score": f"{(m.get('goals') or {}).get('home', 0)}-{(m.get('goals') or {}).get('away', 0)}",
+            })
+        return out
+    except Exception:
         return []
 
+# ---- injuries ---------------------------------------------------------------
 
-def get_team_position(team_id, league_id, season):
+def get_team_injuries(team_id: Optional[int], season: Optional[int]) -> List[Dict[str, Any]]:
+    if not (team_id and season):
+        return []
+    url = f"{BASE_URL}/injuries?team={team_id}&season={season}"
+    resp = _retry_get(url, headers=HEADERS)
+    if resp is None:
+        return []
     try:
-        url = f"{API_BASE}/standings?league={league_id}&season={season}"
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 200:
-            standings = resp.json().get("response", [])
-            for league_data in standings:
-                for team in league_data.get("league", {}).get("standings", [[]])[0]:
-                    if team["team"]["id"] == team_id:
-                        return team.get("rank", None)
-            return None
-        else:
-            print(f"⚠️ Failed to fetch standings for league {league_id}: {resp.status_code}")
-            return None
-    except Exception as e:
-        print(f"❌ Error in get_team_position: {e}")
-        return None
+        injuries = resp.json().get("response", []) or []
+        out = []
+        for i in injuries:
+            player = (i.get("player") or {})
+            out.append({
+                "player": player.get("name"),
+                "position": player.get("position"),
+                "reason": i.get("reason"),
+                "status": "Out",  # API rarely has return dates; keep simple
+            })
+        return out
+    except Exception:
+        return []
