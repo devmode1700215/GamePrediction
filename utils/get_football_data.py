@@ -1,12 +1,16 @@
 # utils/get_football_data.py
+from __future__ import annotations
+
 import os
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from utils.safe_get import safe_get
-from utils.supabaseClient import supabase
 
+# -----------------------------------------------------------------------------
+# Setup
+# -----------------------------------------------------------------------------
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -14,20 +18,20 @@ API_KEY = os.getenv("FOOTBALL_API_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 
-# -------------------------------
-# Fixtures (BY DATE, YYYY-MM-DD)
-# -------------------------------
+
+# -----------------------------------------------------------------------------
+# Fixtures (by single date YYYY-MM-DD)
+# -----------------------------------------------------------------------------
 def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
     """
     Fetch fixtures for a given date (YYYY-MM-DD).
-    Returns the raw list from API-Football (data['response']).
+    Returns the list from API-Football: data['response'].
     """
     url = f"{BASE_URL}/fixtures?date={date_str}"
     resp = safe_get(url, headers=HEADERS)
     if resp is None:
         logger.error(f"⚠️ Failed to fetch fixtures for {date_str}: safe_get returned None")
         return []
-
     try:
         data = resp.json()
         fixtures = data.get("response", []) or []
@@ -38,47 +42,52 @@ def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
         return []
 
 
-# -------------------------------
-# Odds (normalized to a flat dict)
-# -------------------------------
-def get_match_odds(fixture_id: int, preferred_bookmaker: str = "Bwin") -> Dict[str, Optional[float]]:
+# -----------------------------------------------------------------------------
+# Odds (normalized to a flat dict your pipeline expects)
+# -----------------------------------------------------------------------------
+def get_match_odds(
+    fixture_id: int,
+    preferred_bookmaker: str = "Bwin",
+) -> Dict[str, Optional[float]]:
     """
-    Return a normalized odds dict for the fixture:
+    Return normalized odds for the fixture:
       {
         "home_win", "draw", "away_win",
         "btts_yes", "btts_no",
         "over_2_5", "under_2_5"
       }
-    If preferred bookmaker not found, fall back to first bookmaker with data.
+    Tries the preferred bookmaker; falls back to the first with data.
     """
     url = f"{BASE_URL}/odds?fixture={fixture_id}"
     resp = safe_get(url, headers=HEADERS)
-    out = {
+
+    out: Dict[str, Optional[float]] = {
         "home_win": None, "draw": None, "away_win": None,
         "btts_yes": None, "btts_no": None,
-        "over_2_5": None, "under_2_5": None
+        "over_2_5": None, "under_2_5": None,
     }
     if resp is None:
         return out
 
     try:
         data = resp.json()
-        markets = data.get("response", []) or []
-        if not markets:
+        blocks = data.get("response", []) or []
+        if not blocks:
             return out
 
-        # Try to pick preferred bookmaker; else first with data
+        # Pick bookmaker
         chosen = None
-        for entry in markets:
-            for bm in entry.get("bookmakers", []) or []:
+        for blk in blocks:
+            for bm in blk.get("bookmakers", []) or []:
                 if bm.get("name") == preferred_bookmaker:
                     chosen = bm
                     break
             if chosen:
                 break
         if not chosen:
-            for entry in markets:
-                bms = entry.get("bookmakers", []) or []
+            # Fallback: first bookmaker with data
+            for blk in blocks:
+                bms = blk.get("bookmakers", []) or []
                 if bms:
                     chosen = bms[0]
                     break
@@ -93,43 +102,31 @@ def get_match_odds(fixture_id: int, preferred_bookmaker: str = "Bwin") -> Dict[s
             if name == "match winner":
                 for v in values:
                     val = (v.get("value") or "").lower()
-                    odd = v.get("odd")
-                    try:
-                        oddf = float(odd) if odd is not None else None
-                    except (TypeError, ValueError):
-                        oddf = None
+                    odd = _to_float(v.get("odd"))
                     if val == "home":
-                        out["home_win"] = oddf
+                        out["home_win"] = odd
                     elif val == "draw":
-                        out["draw"] = oddf
+                        out["draw"] = odd
                     elif val == "away":
-                        out["away_win"] = oddf
+                        out["away_win"] = odd
 
             elif name in ("both teams to score", "btts", "both teams score"):
                 for v in values:
                     val = (v.get("value") or "").lower()
-                    odd = v.get("odd")
-                    try:
-                        oddf = float(odd) if odd is not None else None
-                    except (TypeError, ValueError):
-                        oddf = None
+                    odd = _to_float(v.get("odd"))
                     if val == "yes":
-                        out["btts_yes"] = oddf
+                        out["btts_yes"] = odd
                     elif val == "no":
-                        out["btts_no"] = oddf
+                        out["btts_no"] = odd
 
             elif name in ("goals over/under", "over/under"):
                 for v in values:
                     val = (v.get("value") or "")
-                    odd = v.get("odd")
-                    try:
-                        oddf = float(odd) if odd is not None else None
-                    except (TypeError, ValueError):
-                        oddf = None
+                    odd = _to_float(v.get("odd"))
                     if val == "Over 2.5":
-                        out["over_2_5"] = oddf
+                        out["over_2_5"] = odd
                     elif val == "Under 2.5":
-                        out["under_2_5"] = oddf
+                        out["under_2_5"] = odd
 
         return out
     except Exception as e:
@@ -137,12 +134,12 @@ def get_match_odds(fixture_id: int, preferred_bookmaker: str = "Bwin") -> Dict[s
         return out
 
 
-# -------------------------------
+# -----------------------------------------------------------------------------
 # Head-to-Head (last few results)
-# -------------------------------
+# -----------------------------------------------------------------------------
 def get_head_to_head(home_id: int, away_id: int, limit: int = 3) -> List[Dict[str, Any]]:
     """
-    Fetch and return last N (default 3) head-to-head fixtures summary.
+    Fetch last `limit` H2H fixtures and return a tiny summary.
     """
     url = f"{BASE_URL}/fixtures/headtohead?h2h={home_id}-{away_id}"
     resp = safe_get(url, headers=HEADERS)
@@ -151,11 +148,13 @@ def get_head_to_head(home_id: int, away_id: int, limit: int = 3) -> List[Dict[st
     try:
         data = resp.json()
         matches = (data.get("response", []) or [])[:limit]
-        out = []
+        out: List[Dict[str, Any]] = []
         for m in matches:
+            fx = m.get("fixture", {}) or {}
+            goals = m.get("goals", {}) or {}
             out.append({
-                "date": m.get("fixture", {}).get("date"),
-                "score": f"{m.get('goals', {}).get('home', 0)}-{m.get('goals', {}).get('away', 0)}"
+                "date": fx.get("date"),
+                "score": f"{goals.get('home', 0)}-{goals.get('away', 0)}",
             })
         return out
     except Exception as e:
@@ -163,13 +162,13 @@ def get_head_to_head(home_id: int, away_id: int, limit: int = 3) -> List[Dict[st
         return []
 
 
-# -------------------------------
+# -----------------------------------------------------------------------------
 # Injuries (per team & season)
-# -------------------------------
+# -----------------------------------------------------------------------------
 def get_team_injuries(team_id: int, season: Optional[int]) -> List[Dict[str, Any]]:
     """
     Return list of injuries for a team in a given season.
-    If season is None, returns [].
+    If season is None, returns [] (API requires season).
     """
     if not season:
         return []
@@ -179,9 +178,9 @@ def get_team_injuries(team_id: int, season: Optional[int]) -> List[Dict[str, Any
         return []
     try:
         data = resp.json()
-        injuries = data.get("response", []) or []
-        out = []
-        for i in injuries:
+        items = data.get("response", []) or []
+        out: List[Dict[str, Any]] = []
+        for i in items:
             player = i.get("player", {}) or {}
             out.append({
                 "player": player.get("name"),
@@ -195,12 +194,12 @@ def get_team_injuries(team_id: int, season: Optional[int]) -> List[Dict[str, Any
         return []
 
 
-# -------------------------------
+# -----------------------------------------------------------------------------
 # League standings (position)
-# -------------------------------
+# -----------------------------------------------------------------------------
 def get_team_position(team_id: int, league_id: Optional[int], season: Optional[int]) -> Optional[int]:
     """
-    Return the team's rank from standings (or None if not found/available).
+    Return the team's rank from standings, or None.
     """
     if not league_id or not season:
         return None
@@ -229,12 +228,59 @@ def get_team_position(team_id: int, league_id: Optional[int], season: Optional[i
         return None
 
 
-# -------------------------------
-# Recent goals (last 5 via API)
-# -------------------------------
+# -----------------------------------------------------------------------------
+# Form + xG (API-based; returns EXACTLY (form_str, xg))
+# -----------------------------------------------------------------------------
+def get_team_form_and_goals(
+    team_id: int,
+    league_id: Optional[int],
+    season: Optional[int],
+) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Matches your main.py expectations:
+      returns (form_str, xg)
+
+    - form_str: e.g. "W-W-D-L-W" (or None if unavailable)
+    - xg: float from API 'expected.goals.for.average.total' (or None)
+    """
+    if not league_id or not season:
+        return None, None
+
+    url = f"{BASE_URL}/teams/statistics?team={team_id}&league={league_id}&season={season}"
+    resp = safe_get(url, headers=HEADERS)
+    if resp is None:
+        return None, None
+
+    try:
+        stats = resp.json().get("response", {}) or {}
+
+        # Form "WWDLW" -> "W-W-D-L-W"
+        form_raw = stats.get("form") or ""
+        form_str = "-".join(list(form_raw)) if form_raw else None
+
+        # xG path: expected.goals.for.average.total
+        expected = stats.get("expected", {}) or {}
+        goals = expected.get("goals", {}) or {}
+        for_side = goals.get("for", {}) or {}
+        avg = for_side.get("average", {}) or {}
+        xg = avg.get("total")
+        try:
+            xg = float(xg) if xg is not None else None
+        except (TypeError, ValueError):
+            xg = None
+
+        return form_str, xg
+    except Exception as e:
+        logger.error(f"⚠️ Error parsing team stats for team {team_id}: {e}")
+        return None, None
+
+
+# -----------------------------------------------------------------------------
+# Recent goals (last N via fixtures endpoint)
+# -----------------------------------------------------------------------------
 def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
     """
-    Get team's goals scored in their last N matches via API.
+    Get the team's goals scored in their last `last` matches via API.
     Returns list like [2,1,0,3,1].
     """
     url = f"{BASE_URL}/fixtures?team={team_id}&last={last}"
@@ -259,94 +305,14 @@ def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
         return []
 
 
-# -------------------------------
-# Team form + goals from your DB
-# -------------------------------
-def get_team_form_and_goals(team_name: str, limit: int = 5, season: Optional[int] = None) -> Dict[str, Any]:
-    """
-    Pull the last `limit` finished matches for a team from your own 'matches' table
-    and compute simple form + average goals for/against.
-
-    Args:
-        team_name: str - The team name.
-        limit: int - Number of matches to consider (default 5).
-        season: optional int - Ignored for now, included for compatibility with callers.
-
-    Returns:
-        {
-            "form": ["W","D","L",...],
-            "avg_goals_for": float,
-            "avg_goals_against": float,
-            "samples": int
-        }
-    """
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _to_float(x: Any) -> Optional[float]:
     try:
-        q = (
-            supabase.table("matches")
-            .select("fixture_id, home_team, away_team, date, results")
-            .or_(f"home_team.eq.{team_name},away_team.eq.{team_name}")
-            .order("date", desc=True)
-            .limit(limit)
-        )
-        resp = q.execute()
-        rows = resp.data or []
-
-        form: List[str] = []
-        gf_total, ga_total, samples = 0, 0, 0
-
-        for m in rows:
-            res = m.get("results")
-            if not res:
-                continue
-
-            sh = sa = None
-            if isinstance(res, dict):
-                sh = res.get("score_home")
-                sa = res.get("score_away")
-                if sh is None and isinstance(res.get("fulltime"), dict):
-                    sh = res["fulltime"].get("home")
-                    sa = res["fulltime"].get("away")
-
-            if sh is None or sa is None:
-                sh = m.get("score_home", sh)
-                sa = m.get("score_away", sa)
-
-            try:
-                sh = int(sh)
-                sa = int(sa)
-            except (TypeError, ValueError):
-                continue
-
-            if m.get("home_team") == team_name:
-                gf, ga = sh, sa
-            else:
-                gf, ga = sa, sh
-
-            gf_total += gf
-            ga_total += ga
-            samples += 1
-
-            if gf > ga:
-                form.append("W")
-            elif gf < ga:
-                form.append("L")
-            else:
-                form.append("D")
-
-        avg_for = (gf_total / samples) if samples else 0.0
-        avg_against = (ga_total / samples) if samples else 0.0
-
-        return {
-            "form": form,
-            "avg_goals_for": round(avg_for, 3),
-            "avg_goals_against": round(avg_against, 3),
-            "samples": samples,
-        }
-
-    except Exception as e:
-        logger.error(f"⚠️ Error computing team form/goals for '{team_name}': {e}")
-        return {"form": [], "avg_goals_for": 0.0, "avg_goals_against": 0.0, "samples": 0}
-
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 __all__ = [
