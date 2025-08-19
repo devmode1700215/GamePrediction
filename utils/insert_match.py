@@ -1,81 +1,72 @@
+import logging
+import json
 from utils.supabaseClient import supabase
+from utils.get_football_data import (
+    get_match_odds,
+    get_head_to_head,
+    get_team_injuries,
+    get_team_position
+)
 
-ODDS_KEYS = [
-    "home_win", "draw", "away_win",
-    "btts_yes", "btts_no",
-    "over_2_5", "under_2_5",
-]
+logger = logging.getLogger(__name__)
 
-def _to_float(x):
+def insert_match(fixture):
+    """
+    Takes raw fixture from API-Football and enriches it with odds, injuries, H2H,
+    standings. Then inserts into Supabase 'matches' table.
+    """
+
     try:
-        if x is None:
-            return None
-        return float(x)
-    except (ValueError, TypeError):
-        return None
+        fixture_id = fixture["fixture"]["id"]
+        league = fixture["league"]
+        teams = fixture["teams"]
 
-def _empty_odds():
-    return {k: None for k in ODDS_KEYS}
+        # Odds
+        odds_data = get_match_odds(fixture_id)
+        odds_clean = None
+        if odds_data:
+            try:
+                # Flatten common markets if available
+                bookmaker = odds_data[0]["bookmakers"][0]
+                bets = bookmaker.get("bets", [])
+                odds_clean = {}
+                for b in bets:
+                    if b["name"].lower() in ["match winner", "both teams to score", "over/under"]:
+                        for v in b["values"]:
+                            odds_clean[v["value"].lower().replace(" ", "_")] = float(v["odd"])
+            except Exception as e:
+                logger.warning(f"⚠️ Could not clean odds for fixture {fixture_id}: {e}")
 
-def _normalize_odds(odds_raw):
-    """
-    Normalize raw odds (dict/list/None) into a flat dict or None.
-    """
-    if odds_raw is None:
-        return None
-
-    # Already flat dict with expected keys
-    if isinstance(odds_raw, dict):
-        normalized = _empty_odds()
-        for k in ODDS_KEYS:
-            normalized[k] = _to_float(odds_raw.get(k))
-        return normalized if any(v is not None for v in normalized.values()) else None
-
-    # Array from API (take first usable dict or flatten bookmaker block)
-    if isinstance(odds_raw, list):
-        merged = _empty_odds()
-        found = False
-        for item in odds_raw:
-            if isinstance(item, dict):
-                # If it’s already flat
-                if any(k in item for k in ODDS_KEYS):
-                    for k in ODDS_KEYS:
-                        if merged[k] is None:
-                            merged[k] = _to_float(item.get(k))
-                            if merged[k] is not None:
-                                found = True
-        return merged if found else None
-
-    return None
-
-def insert_match(match_data):
-    fixture_id = match_data["fixture_id"]
-    home_injuries = match_data["home_team"]["injuries"]
-    away_injuries = match_data["away_team"]["injuries"]
-
-    injuries_data = None
-    if home_injuries or away_injuries:
-        injuries_data = {
-            match_data["home_team"]["name"]: home_injuries,
-            match_data["away_team"]["name"]: away_injuries
+        # Injuries
+        injuries = {
+            teams["home"]["name"]: get_team_injuries(teams["home"]["id"]),
+            teams["away"]["name"]: get_team_injuries(teams["away"]["id"]),
         }
 
-    # Normalize odds
-    normalized_odds = _normalize_odds(match_data.get("odds"))
+        # Head-to-head
+        h2h = get_head_to_head(teams["home"]["id"], teams["away"]["id"])
 
-    # Prepare cleaned data
-    league_info = match_data["league"]
-    cleaned = {
-        "fixture_id": fixture_id,
-        "date": match_data["date"],
-        "league": f"{league_info['name']} ({league_info['country']} - {league_info['round']})",
-        "home_team": match_data["home_team"]["name"],
-        "away_team": match_data["away_team"]["name"],
-        "odds": normalized_odds,
-        "injuries": injuries_data,
-        "venue": match_data["venue"],
-        "head_to_head": match_data["head_to_head"],
-        "created_at": match_data["created_at"]
-    }
+        # Standings positions
+        home_pos = get_team_position(league["id"], league["season"], teams["home"]["id"])
+        away_pos = get_team_position(league["id"], league["season"], teams["away"]["id"])
 
-    supabase.table("matches").insert(cleaned).execute()
+        cleaned = {
+            "fixture_id": fixture_id,
+            "date": fixture["fixture"]["date"],
+            "league": f"{league['name']} ({league['country']} - {league['round']})",
+            "home_team": teams["home"]["name"],
+            "away_team": teams["away"]["name"],
+            "venue": fixture["fixture"]["venue"]["name"] if fixture["fixture"]["venue"] else None,
+            "odds": json.dumps(odds_clean) if odds_clean else None,
+            "injuries": json.dumps(injuries) if injuries else None,
+            "head_to_head": json.dumps(h2h) if h2h else None,
+            "home_position": home_pos["rank"] if home_pos else None,
+            "away_position": away_pos["rank"] if away_pos else None,
+            "created_at": fixture["fixture"]["date"],  # could also be datetime.utcnow().isoformat()
+        }
+
+        supabase.table("matches").upsert(cleaned, on_conflict="fixture_id").execute()
+        logger.info(f"✅ Stored fixture {fixture_id}: {teams['home']['name']} vs {teams['away']['name']}")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to insert fixture {fixture.get('fixture', {}).get('id')}: {e}")
