@@ -262,30 +262,30 @@ def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
 # -------------------------------
 # Team form + goals from your DB
 # -------------------------------
-def get_team_form_and_goals(team_name: str, limit: int = 5) -> Dict[str, Any]:
+def get_team_form_and_goals(team_name: str, limit: int = 5, season: Optional[int] = None) -> Dict[str, Any]:
     """
     Pull the last `limit` finished matches for a team from your own 'matches' table
     and compute simple form + average goals for/against.
 
-    Assumes 'matches' has:
-      - columns: fixture_id, home_team, away_team, date
-      - a 'results' JSON or composite with score_home, score_away (if finished)
+    Args:
+        team_name: str - The team name.
+        limit: int - Number of matches to consider (default 5).
+        season: optional int - Ignored for now, included for compatibility with callers.
 
     Returns:
-      {
-        "form": ["W","D","L",...],  # recent first
-        "avg_goals_for": float,
-        "avg_goals_against": float,
-        "samples": int
-      }
+        {
+            "form": ["W","D","L",...],
+            "avg_goals_for": float,
+            "avg_goals_against": float,
+            "samples": int
+        }
     """
     try:
-        # Pull recent matches involving the team, newest first (default ASC, so we set desc=True)
         q = (
             supabase.table("matches")
             .select("fixture_id, home_team, away_team, date, results")
             .or_(f"home_team.eq.{team_name},away_team.eq.{team_name}")
-            .order("date", desc=True)  # IMPORTANT: no 'asc=' keyword
+            .order("date", desc=True)
             .limit(limit)
         )
         resp = q.execute()
@@ -296,38 +296,27 @@ def get_team_form_and_goals(team_name: str, limit: int = 5) -> Dict[str, Any]:
 
         for m in rows:
             res = m.get("results")
-            # results could be None or missing if not finished
             if not res:
                 continue
 
-            # Support both JSON object or flat dict with keys
-            # Try common keys:
-            sh = None
-            sa = None
-
+            sh = sa = None
             if isinstance(res, dict):
-                # typical JSON storage
                 sh = res.get("score_home")
                 sa = res.get("score_away")
-                # Sometimes stored nested (e.g., {"fulltime":{"home":x,"away":y}})
                 if sh is None and isinstance(res.get("fulltime"), dict):
                     sh = res["fulltime"].get("home")
                     sa = res["fulltime"].get("away")
 
-            # If still None, try fallback columns (in case your table stores them flat)
             if sh is None or sa is None:
-                # The row might have score_home / score_away at top level (rare)
                 sh = m.get("score_home", sh)
                 sa = m.get("score_away", sa)
 
-            # If we still don't have integers, skip
             try:
                 sh = int(sh)
                 sa = int(sa)
             except (TypeError, ValueError):
                 continue
 
-            # Decide perspective
             if m.get("home_team") == team_name:
                 gf, ga = sh, sa
             else:
@@ -357,6 +346,7 @@ def get_team_form_and_goals(team_name: str, limit: int = 5) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"⚠️ Error computing team form/goals for '{team_name}': {e}")
         return {"form": [], "avg_goals_for": 0.0, "avg_goals_against": 0.0, "samples": 0}
+
 
 
 __all__ = [
