@@ -1,128 +1,103 @@
-# utils/get_prediction.py
-# -*- coding: utf-8 -*-
-import logging
-import json
-import math
-from statistics import mean
+# utils/recent_form.py
+from typing import List, Dict, Any
+from utils.supabaseClient import supabase
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-CONF_MIN = 70.0  # threshold in % (still used for filtering if you want)
-
-def poisson_prob(lmbda: float, k: int) -> float:
-    """Poisson probability for k events given mean λ."""
-    try:
-        return (math.exp(-lmbda) * (lmbda ** k)) / math.factorial(k)
-    except Exception:
-        return 0.0
-
-def expected_goals(goals: list[int]) -> float:
-    """Return average goals scored from recent matches."""
-    if not goals:
-        return 1.2  # fallback
-    return mean(goals)
-
-def calculate_over25_prob(home_goals, away_goals, h2h_scores) -> float:
+def _score_from_row(row: Dict[str, Any], team_name: str) -> int | None:
     """
-    Estimate probability of Over 2.5 using Poisson model + H2H.
+    Returns the goals scored by team_name in this fixture, or None if unknown.
+    Supports:
+      - Separate 'results' table (preferred)
+      - Optional 'results' JSON on matches (fallback)
     """
-    home_avg = expected_goals(home_goals)
-    away_avg = expected_goals(away_goals)
+    is_home = row.get("home_team") == team_name
+    is_away = row.get("away_team") == team_name
 
-    lmbda_home = home_avg or 1.2
-    lmbda_away = away_avg or 1.0
+    # Prefer explicit scores from results table if present
+    if "score_home" in row and "score_away" in row:
+        if is_home:
+            return row["score_home"]
+        if is_away:
+            return row["score_away"]
 
-    # probability distribution of total goals 0–5
-    probs = {}
-    for gh in range(0, 6):
-        for ga in range(0, 6):
-            p = poisson_prob(lmbda_home, gh) * poisson_prob(lmbda_away, ga)
-            total = gh + ga
-            probs[total] = probs.get(total, 0) + p
+    # Fallback: matches.results JSON with keys score_home/score_away
+    res = row.get("results")
+    if isinstance(res, dict):
+        sh = res.get("score_home")
+        sa = res.get("score_away")
+        if is_home and isinstance(sh, (int, float)):
+            return int(sh)
+        if is_away and isinstance(sa, (int, float)):
+            return int(sa)
 
-    prob_over25 = sum(p for g, p in probs.items() if g >= 3)
+    return None
 
-    # small adjustment from head-to-head (if many were high scoring)
-    if h2h_scores:
-        over_games = sum(1 for s in h2h_scores if (int(s.split("-")[0]) + int(s.split("-")[1])) >= 3)
-        ratio = over_games / len(h2h_scores)
-        prob_over25 = (prob_over25 * 0.7) + (ratio * 0.3)
-
-    return prob_over25 * 100  # %
-
-def get_prediction(match_data: dict) -> dict | None:
+def fetch_recent_goals(team_name: str, limit: int = 5) -> List[int]:
     """
-    Pure math prediction — replaces GPT.
-    match_data must include: fixture_id, odds, home_team.recent_goals, away_team.recent_goals, head_to_head.
+    Get recent 'limit' finished fixtures involving team_name
+    and return a list of goals scored by that team in each.
+    Looks for scores in the 'results' table; falls back to matches.results JSON if you have it.
     """
-    try:
-        fixture_id = match_data.get("fixture_id")
-        odds = match_data.get("odds") or {}
-        home_goals = match_data.get("home_team", {}).get("recent_goals", []) or []
-        away_goals = match_data.get("away_team", {}).get("recent_goals", []) or []
-        h2h = [h.get("score") for h in (match_data.get("head_to_head") or []) if h.get("score")]
+    if not team_name:
+        return []
 
-        # Calculate probability for Over 2.5
-        prob_over25 = calculate_over25_prob(home_goals, away_goals, h2h)
-        prob_under25 = 100 - prob_over25
+    # 1) Find recent fixture_ids from matches (team appears home or away), newest first
+    m = (
+        supabase.table("matches")
+        .select("fixture_id, date, home_team, away_team")
+        .or_(f"home_team.eq.{team_name},away_team.eq.{team_name}")
+        .order("date", desc=True)
+        .limit(50)  # grab a buffer; we’ll filter by finished ones below
+        .execute()
+    ).data or []
 
-        # Extract market odds
-        odd_over = odds.get("over_2_5")
-        odd_under = odds.get("under_2_5")
+    if not m:
+        return []
 
-        predictions = {}
+    fixture_ids = [row["fixture_id"] for row in m if row.get("fixture_id")]
 
-        # --- Over 2.5 ---
-        if odd_over:
-            implied = 100 / odd_over
-            edge = prob_over25 - implied
-            predictions["over_2_5"] = {
-                "prediction": "Over",
-                "confidence": round(prob_over25, 2),
-                "implied_odds_pct": round(implied, 2),
-                "edge": round(edge, 2),
-                "po_value": edge > 0,
-                "odds": odd_over,
-                "bankroll_pct": round(max(edge, 0) / 10, 2),  # simple Kelly fraction
-                "rationale": f"Based on avg goals ({mean(home_goals or [1]):.2f} vs {mean(away_goals or [1]):.2f}) "
-                             f"and H2H trend, Over 2.5 has {prob_over25:.1f}% probability vs implied {implied:.1f}%."
-            }
+    # 2) Pull results for those fixtures (if you have a 'results' table)
+    results_map: Dict[int, Dict[str, Any]] = {}
+    if fixture_ids:
+        # chunk in batches of 500 to be safe
+        CHUNK = 500
+        for i in range(0, len(fixture_ids), CHUNK):
+            chunk = fixture_ids[i:i+CHUNK]
+            r = (
+                supabase.table("results")
+                .select("fixture_id, score_home, score_away")
+                .in_("fixture_id", chunk)
+                .execute()
+            ).data or []
+            for row in r:
+                results_map[row["fixture_id"]] = row
 
-        # --- Under 2.5 ---
-        if odd_under:
-            implied = 100 / odd_under
-            edge = prob_under25 - implied
-            predictions["under_2_5"] = {
-                "prediction": "Under",
-                "confidence": round(prob_under25, 2),
-                "implied_odds_pct": round(implied, 2),
-                "edge": round(edge, 2),
-                "po_value": edge > 0,
-                "odds": odd_under,
-                "bankroll_pct": round(max(edge, 0) / 10, 2),
-                "rationale": f"Based on avg goals and H2H, Under 2.5 has {prob_under25:.1f}% probability vs implied {implied:.1f}%."
-            }
+    # 3) Compose rows with scores (prefer 'results'; optionally attach matches.results if you store it)
+    enriched: List[Dict[str, Any]] = []
+    # If your matches table also stores a results JSON column, pull it (optional)
+    # To keep the selection light we didn’t include matches.results above. If you need it, re-query per fixture.
 
-        return {
-            "fixture_id": fixture_id,
-            "predictions": predictions
-        }
+    for row in m:
+        fid = row.get("fixture_id")
+        # try results table first
+        if fid in results_map:
+            enriched.append({
+                **row,
+                "score_home": results_map[fid]["score_home"],
+                "score_away": results_map[fid]["score_away"],
+                "results": None,  # not used when we have explicit scores
+            })
+        else:
+            # OPTIONAL: if you do have a 'results' JSON on matches, you can fetch it fixture-by-fixture or
+            # expand the initial select to include it. For performance, we keep it simple:
+            pass
 
-    except Exception as e:
-        logger.error(f"❌ Error in math prediction: {e}")
-        return None
+    # 4) Take the most recent 'limit' fixtures with known scores and convert to goals-for
+    goals: List[int] = []
+    for row in enriched:
+        g = _score_from_row(row, team_name)
+        if g is not None:
+            goals.append(g)
+        if len(goals) >= limit:
+            break
 
-
-if __name__ == "__main__":
-    # quick test
-    dummy = {
-        "fixture_id": 123,
-        "home_team": {"recent_goals": [2, 1, 3, 0, 2]},
-        "away_team": {"recent_goals": [1, 2, 0, 1, 1]},
-        "odds": {"over_2_5": 2.0, "under_2_5": 1.8},
-        "head_to_head": [{"score": "2-1"}, {"score": "1-0"}, {"score": "3-2"}]
-    }
-    result = get_prediction(dummy)
-    print(json.dumps(result, indent=2))
+    return goals
