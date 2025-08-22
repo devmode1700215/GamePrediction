@@ -1,103 +1,208 @@
-# utils/recent_form.py
-from typing import List, Dict, Any
-from utils.supabaseClient import supabase
+# utils/get_prediction.py
+import logging
+import math
+from typing import Any, Dict, List, Optional
 
-def _score_from_row(row: Dict[str, Any], team_name: str) -> int | None:
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _to_float(x: Any) -> Optional[float]:
+    """Robust float cast: handles None and 'None' strings."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, str) and x.strip().lower() == "none":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def _to_int(x: Any) -> Optional[int]:
+    """Robust int cast: handles None and 'None' strings and numeric strings."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, str) and x.strip().lower() == "none":
+            return None
+        # Accept floats like "1.0" by converting to float first, then int if integral
+        if isinstance(x, str) and "." in x:
+            f = _to_float(x)
+            if f is None:
+                return None
+            return int(round(f))
+        return int(x)
+    except Exception:
+        return None
+
+def _clean_goals_list(values: Any) -> List[int]:
+    """Sanitize a 'recent_goals' array into integers, dropping bad entries."""
+    out: List[int] = []
+    if not isinstance(values, list):
+        return out
+    for v in values:
+        iv = _to_int(v)
+        if iv is not None and iv >= 0:
+            out.append(iv)
+    return out
+
+def _mean(lst: List[float]) -> Optional[float]:
+    if not lst:
+        return None
+    return sum(lst) / len(lst)
+
+def _poisson_pmf(k: int, lam: float) -> float:
+    # P(X=k) = e^{-λ} λ^k / k!
+    if lam <= 0:
+        return 0.0 if k > 0 else 1.0
+    try:
+        return math.exp(-lam) * (lam ** k) / math.factorial(k)
+    except Exception:
+        return 0.0
+
+def _prob_over25_from_lambdas(lam_home: float, lam_away: float) -> float:
     """
-    Returns the goals scored by team_name in this fixture, or None if unknown.
-    Supports:
-      - Separate 'results' table (preferred)
-      - Optional 'results' JSON on matches (fallback)
+    If goals are Poisson(λh) + Poisson(λa) => Poisson(λ = λh + λa).
+    P(Total > 2.5) = 1 - [P(0) + P(1) + P(2)]
     """
-    is_home = row.get("home_team") == team_name
-    is_away = row.get("away_team") == team_name
+    lam_total = max(0.0, lam_home) + max(0.0, lam_away)
+    p0 = _poisson_pmf(0, lam_total)
+    p1 = _poisson_pmf(1, lam_total)
+    p2 = _poisson_pmf(2, lam_total)
+    return max(0.0, min(1.0, 1.0 - (p0 + p1 + p2)))
 
-    # Prefer explicit scores from results table if present
-    if "score_home" in row and "score_away" in row:
-        if is_home:
-            return row["score_home"]
-        if is_away:
-            return row["score_away"]
+def _implied_pct_from_odds(odds: float) -> Optional[float]:
+    if odds is None or odds <= 1.0:
+        return None
+    return 100.0 / odds
 
-    # Fallback: matches.results JSON with keys score_home/score_away
-    res = row.get("results")
-    if isinstance(res, dict):
-        sh = res.get("score_home")
-        sa = res.get("score_away")
-        if is_home and isinstance(sh, (int, float)):
-            return int(sh)
-        if is_away and isinstance(sa, (int, float)):
-            return int(sa)
-
-    return None
-
-def fetch_recent_goals(team_name: str, limit: int = 5) -> List[int]:
+def _stake_pct_from_edge(edge_pct: float) -> float:
     """
-    Get recent 'limit' finished fixtures involving team_name
-    and return a list of goals scored by that team in each.
-    Looks for scores in the 'results' table; falls back to matches.results JSON if you have it.
+    Simple stake sizing: 0.5% per 1% of edge, clamped to [0.5%, 3%].
     """
-    if not team_name:
-        return []
+    raw = 0.5 * max(0.0, edge_pct)  # 0.5% per edge point
+    return max(0.5, min(3.0, raw))
 
-    # 1) Find recent fixture_ids from matches (team appears home or away), newest first
-    m = (
-        supabase.table("matches")
-        .select("fixture_id, date, home_team, away_team")
-        .or_(f"home_team.eq.{team_name},away_team.eq.{team_name}")
-        .order("date", desc=True)
-        .limit(50)  # grab a buffer; we’ll filter by finished ones below
-        .execute()
-    ).data or []
+# ---------------------------
+# Core predictor
+# ---------------------------
 
-    if not m:
-        return []
+def _build_over_under_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Build an Over/Under 2.5 prediction using:
+      - recent goals arrays (home/away)
+      - Poisson model on total goals
+      - market odds from match_data['odds']
+    Returns a dict for 'over_2_5' if we can compute, else None.
+    """
+    odds_block = match_data.get("odds") or {}
+    over_odds = _to_float(odds_block.get("over_2_5"))
+    under_odds = _to_float(odds_block.get("under_2_5"))
 
-    fixture_ids = [row["fixture_id"] for row in m if row.get("fixture_id")]
+    # We need at least one side of the OU market to proceed
+    if over_odds is None and under_odds is None:
+        logger.info("🪙 Skipping math prediction: no over/under odds available.")
+        return None
 
-    # 2) Pull results for those fixtures (if you have a 'results' table)
-    results_map: Dict[int, Dict[str, Any]] = {}
-    if fixture_ids:
-        # chunk in batches of 500 to be safe
-        CHUNK = 500
-        for i in range(0, len(fixture_ids), CHUNK):
-            chunk = fixture_ids[i:i+CHUNK]
-            r = (
-                supabase.table("results")
-                .select("fixture_id, score_home, score_away")
-                .in_("fixture_id", chunk)
-                .execute()
-            ).data or []
-            for row in r:
-                results_map[row["fixture_id"]] = row
+    # Pull and sanitize recent goals
+    home_team = (match_data.get("home_team") or {})
+    away_team = (match_data.get("away_team") or {})
+    home_recent = _clean_goals_list(home_team.get("recent_goals"))
+    away_recent = _clean_goals_list(away_team.get("recent_goals"))
 
-    # 3) Compose rows with scores (prefer 'results'; optionally attach matches.results if you store it)
-    enriched: List[Dict[str, Any]] = []
-    # If your matches table also stores a results JSON column, pull it (optional)
-    # To keep the selection light we didn’t include matches.results above. If you need it, re-query per fixture.
+    # If we truly have nothing, we can't model
+    if not home_recent and not away_recent:
+        logger.info("📉 Skipping math prediction: no recent goals data found.")
+        return None
 
-    for row in m:
-        fid = row.get("fixture_id")
-        # try results table first
-        if fid in results_map:
-            enriched.append({
-                **row,
-                "score_home": results_map[fid]["score_home"],
-                "score_away": results_map[fid]["score_away"],
-                "results": None,  # not used when we have explicit scores
-            })
-        else:
-            # OPTIONAL: if you do have a 'results' JSON on matches, you can fetch it fixture-by-fixture or
-            # expand the initial select to include it. For performance, we keep it simple:
-            pass
+    # Use means; if one side missing, fallback to a small league-average proxy (1.2 goals)
+    home_avg = _mean(home_recent) if home_recent else 1.2
+    away_avg = _mean(away_recent) if away_recent else 1.2
 
-    # 4) Take the most recent 'limit' fixtures with known scores and convert to goals-for
-    goals: List[int] = []
-    for row in enriched:
-        g = _score_from_row(row, team_name)
-        if g is not None:
-            goals.append(g)
-        if len(goals) >= limit:
-            break
+    # Tiny guards
+    if home_avg is None or away_avg is None:
+        logger.info("📉 Skipping math prediction: recent goals means unavailable.")
+        return None
 
-    return goals
+    # Poisson model for total goals > 2.5
+    p_over = _prob_over25_from_lambdas(home_avg, away_avg)
+    p_under = 1.0 - p_over
+
+    # Choose the side with better edge (only if odds for that side exists)
+    best = None
+
+    if over_odds is not None:
+        implied_over = _implied_pct_from_odds(over_odds)
+        if implied_over is not None:
+            over_pct = p_over * 100.0
+            over_edge = over_pct - implied_over
+            best = ("Over", over_odds, over_pct, over_edge)
+
+    if under_odds is not None:
+        implied_under = _implied_pct_from_odds(under_odds)
+        if implied_under is not None:
+            under_pct = p_under * 100.0
+            under_edge = under_pct - implied_under
+            if best is None or under_edge > best[3]:
+                best = ("Under", under_odds, under_pct, under_edge)
+
+    if best is None:
+        logger.info("📉 Skipping math prediction: no valid OU side with usable odds.")
+        return None
+
+    side, side_odds, side_prob_pct, edge_pct = best
+    po_value = edge_pct >= 0.0  # profitable overlay if our prob% >= market implied%
+
+    return {
+        "prediction": side,
+        "confidence": round(float(side_prob_pct), 2),   # as percent
+        "implied_odds_pct": round(float(_implied_pct_from_odds(side_odds) or 0.0), 2),
+        "edge": round(float(edge_pct), 2),
+        "po_value": po_value,
+        "odds": round(float(side_odds), 2),
+        "bankroll_pct": round(_stake_pct_from_edge(edge_pct), 2),
+        "rationale": (
+            f"Poisson on recent goals (home_avg={home_avg:.2f}, away_avg={away_avg:.2f}); "
+            f"prob_over={p_over:.3f}, prob_under={p_under:.3f}."
+        ),
+    }
+
+# ---------------------------
+# Public API
+# ---------------------------
+
+def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Math-only predictor (no AI). Returns:
+    {
+      "fixture_id": ...,
+      "predictions": {
+         "over_2_5": { ... }   # only present if we could compute
+      }
+    }
+    or None if nothing computable for this fixture.
+    """
+    try:
+        fixture_id = match_data.get("fixture_id")
+        if not fixture_id:
+            logger.info("Skipping prediction: missing fixture_id.")
+            return None
+
+        # Build OU prediction if possible
+        ou = _build_over_under_prediction(match_data)
+        if not ou:
+            return None
+
+        return {
+            "fixture_id": fixture_id,
+            "predictions": {
+                "over_2_5": ou
+            }
+        }
+    except Exception as e:
+        logger.error(f"❌ Error in math prediction: {e}")
+        return None
