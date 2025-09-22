@@ -123,7 +123,7 @@ def _responses_tokens_kw() -> str:
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _responses_supports_param(name: str) -> bool:
-    """Return True if client.responses.create supports a given kwarg."""
+    """True if client.responses.create supports a given kwarg."""
     try:
         return name in inspect.signature(client.responses.create).parameters
     except Exception:
@@ -140,7 +140,6 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
             yield v
             yield from _iter_all_values(v)
     else:
-        # SDK objects: try model_dump()/dict()
         for attr in ("model_dump", "dict"):
             try:
                 if hasattr(obj, attr):
@@ -150,7 +149,6 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
                     return
             except Exception:
                 pass
-        # Probe common attributes
         for name in ("content", "output", "parsed", "text"):
             try:
                 v = getattr(obj, name, None)
@@ -241,6 +239,34 @@ def _extract_json_snippet(s: str) -> str:
     return s[start:end+1] if (start != -1 and end != -1 and end > start) else s.strip()
 
 # ------------------------------------------------------------------------------
+# Chat Completions helpers (support message.parsed)
+# ------------------------------------------------------------------------------
+def _extract_from_chat(cc) -> Optional[Dict[str, Any]]:
+    """
+    Handle both content and parsed payloads from Chat Completions.
+    """
+    try:
+        choices = getattr(cc, "choices", []) or []
+        for ch in choices:
+            msg = getattr(ch, "message", None)
+            if msg is None:
+                continue
+            # Newer SDKs: parsed JSON lives here when response_format=json_schema
+            parsed = getattr(msg, "parsed", None)
+            if isinstance(parsed, dict):
+                return parsed
+            # Fallback to text content
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip():
+                try:
+                    return json.loads(_extract_json_snippet(content))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+# ------------------------------------------------------------------------------
 # Backstop (if model returns nothing or partial)
 # ------------------------------------------------------------------------------
 def _default_stub_over25(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -282,7 +308,7 @@ def _chat_tokens_kwargs(n: int = 900) -> dict:
     return {"max_tokens": n}
 
 # ------------------------------------------------------------------------------
-# Model call (with capability checks per SDK) — with explicit errors per path
+# Model call (with capability checks per SDK) — explicit errors per path
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -370,15 +396,10 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
                 **_chat_tokens_kwargs(900),
             )
-            text = cc.choices[0].message.content
-            json_text = _extract_json_snippet(text)
-            if json_text:
-                try:
-                    return json.loads(json_text)
-                except Exception as je:
-                    last_err = ValueError(f"Chat with response_format returned non-JSON text: {je}")
-            else:
-                last_err = RuntimeError("Chat with response_format returned empty output.")
+            parsed = _extract_from_chat(cc)
+            if parsed is not None:
+                return parsed
+            last_err = RuntimeError("Chat with response_format returned empty output (no parsed/content).")
         except TypeError as e_c1:
             last_err = e_c1
         except Exception as e_c2:
@@ -395,15 +416,10 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 ],
                 **_chat_tokens_kwargs(900),
             )
-            text = cc.choices[0].message.content
-            json_text = _extract_json_snippet(text)
-            if json_text:
-                try:
-                    return json.loads(json_text)
-                except Exception as je:
-                    last_err = ValueError(f"Chat fallback returned non-JSON text: {je}")
-            else:
-                last_err = RuntimeError("Chat fallback returned empty output.")
+            parsed = _extract_from_chat(cc)
+            if parsed is not None:
+                return parsed
+            last_err = RuntimeError("Chat fallback returned empty output (no parsed/content).")
         except Exception as e_c3:
             last_err = e_c3
 
