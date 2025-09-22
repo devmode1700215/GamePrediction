@@ -1,5 +1,6 @@
 # utils/get_prediction.py
 # -*- coding: utf-8 -*-
+
 import os
 import json
 import time
@@ -14,13 +15,15 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# --- Config -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-mini")
 MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 RETRY_BACKOFF_SEC = float(os.getenv("OPENAI_RETRY_BACKOFF_SEC", "2.0"))
 
-# odds guards used by your insertion logic
+# guardrails used by your insertion logic
 MIN_ODDS = float(os.getenv("PREDICTION_MIN_ODDS", "1.6"))
 MAX_ODDS = float(os.getenv("PREDICTION_MAX_ODDS", "2.3"))
 
@@ -29,68 +32,68 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---- Structured output schema ------------------------------------------------
-PREDICTION_SCHEMA = {
-    "name": "MatchPredictions",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "fixture_id": {"type": "integer"},
-            "predictions": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "one_x_two": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "prediction": {"type": "string", "enum": ["Home", "Draw", "Away"]},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 100},
-                            "edge": {"type": "number"},
-                            "po_value": {"type": "boolean"},
-                            "odds": {"type": "number"},
-                            "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
-                            "rationale": {"type": "string"}
-                        },
-                        "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
+# ------------------------------------------------------------------------------
+# Structured Output Schema (for JSON Schema mode)
+# ------------------------------------------------------------------------------
+SCHEMA_NAME = "MatchPredictions"
+PREDICTION_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "fixture_id": {"type": "integer"},
+        "predictions": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "one_x_two": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "prediction": {"type": "string", "enum": ["Home", "Draw", "Away"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 100},
+                        "edge": {"type": "number"},
+                        "po_value": {"type": "boolean"},
+                        "odds": {"type": "number"},
+                        "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
+                        "rationale": {"type": "string"}
                     },
-                    "btts": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "prediction": {"type": "string", "enum": ["Yes", "No"]},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 100},
-                            "edge": {"type": "number"},
-                            "po_value": {"type": "boolean"},
-                            "odds": {"type": "number"},
-                            "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
-                            "rationale": {"type": "string"}
-                        },
-                        "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
-                    },
-                    "over_2_5": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "prediction": {"type": "string", "enum": ["Over", "Under"]},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 100},
-                            "edge": {"type": "number"},
-                            "po_value": {"type": "boolean"},
-                            "odds": {"type": "number"},
-                            "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
-                            "rationale": {"type": "string"}
-                        },
-                        "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
-                    }
+                    "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
                 },
-                "required": ["one_x_two", "btts", "over_2_5"]
-            }
-        },
-        "required": ["fixture_id", "predictions"]
+                "btts": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "prediction": {"type": "string", "enum": ["Yes", "No"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 100},
+                        "edge": {"type": "number"},
+                        "po_value": {"type": "boolean"},
+                        "odds": {"type": "number"},
+                        "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
+                },
+                "over_2_5": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "prediction": {"type": "string", "enum": ["Over", "Under"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 100},
+                        "edge": {"type": "number"},
+                        "po_value": {"type": "boolean"},
+                        "odds": {"type": "number"},
+                        "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
+                }
+            },
+            "required": ["one_x_two", "btts", "over_2_5"]
+        }
     },
-    "strict": True
+    "required": ["fixture_id", "predictions"]
 }
+STRICT_OUTPUT = True
 
 SYSTEM_INSTRUCTIONS = (
     "You are an expert football betting analyst. "
@@ -101,7 +104,9 @@ SYSTEM_INSTRUCTIONS = (
     "Return ONLY JSON conforming to the provided schema."
 )
 
-# ---- Validation helpers ------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Validation helpers
+# ------------------------------------------------------------------------------
 def _validate_prediction_block(name: str, block: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     required = ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
     missing = [k for k in required if k not in block]
@@ -127,40 +132,44 @@ def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             return False, err
     return True, None
 
-# ---- Compatibility helpers ---------------------------------------------------
+# ------------------------------------------------------------------------------
+# Responses API compatibility helpers
+# ------------------------------------------------------------------------------
 def _supports_arg(fn, name: str) -> bool:
     try:
         return name in inspect.signature(fn).parameters
     except Exception:
         return False
 
-def _responses_tokens_arg() -> str:
-    """Return the correct tokens kw: 'max_output_tokens' (Responses) or 'max_tokens' (older)."""
-    fn = client.responses.create
-    if _supports_arg(fn, "max_output_tokens"):
-        return "max_output_tokens"
-    return "max_tokens"
+def _responses_tokens_kw() -> str:
+    """Return the correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
+    return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
-# ---- Model call --------------------------------------------------------------
+def _parse_responses_text(resp) -> str:
+    """Extract output_text from a Responses API response."""
+    # Prefer aggregate convenience field if present
+    text = getattr(resp, "output_text", None)
+    if text:
+        return text
+    # Otherwise, stitch from output/content
+    text_out = ""
+    for item in getattr(resp, "output", []):
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                text_out += c.get("text", "")
+    return text_out
+
+# ------------------------------------------------------------------------------
+# Model call (with compat shim across SDKs)
+# ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls GPT-5 mini with best-available method:
-    1) Responses API with text.format (JSON schema)
-    2) Responses API with response_format (older)
-    3) Chat Completions fallback (oldest)
+      A) Responses API + text.format (JSON schema w/ name+schema+strict)
+      B) Responses API + response_format (older)
+      C) Chat Completions fallback
     """
-    import inspect
-
-    def _supports_arg(fn, name: str) -> bool:
-        try:
-            return name in inspect.signature(fn).parameters
-        except Exception:
-            return False
-
-    def _responses_tokens_arg() -> str:
-        return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
-
-    # ✅ Use input_text everywhere (no "text" type)
+    # Use input_text for all content parts
     msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
     msg_user = {
         "role": "user",
@@ -171,14 +180,22 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     last_err: Optional[Exception] = None
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # -------- Path A: Responses with text.format -----------
-            tokens_kw = _responses_tokens_arg()
+            # ---- Path A: Responses with text.format ----
+            tokens_kw = _responses_tokens_kw()
             kwargs = {
                 "model": MODEL_NAME,
                 "input": [msg_system, msg_user],
-                "text": {"format": {"type": "json_schema", "json_schema": PREDICTION_SCHEMA}},
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": SCHEMA_NAME,
+                        "schema": PREDICTION_JSON_SCHEMA,
+                        "strict": STRICT_OUTPUT,
+                    }
+                },
                 "temperature": 0.2,
                 tokens_kw: 900,
             }
@@ -188,24 +205,25 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             if parsed is not None:
                 return parsed
 
-            text_out = ""
-            for item in getattr(resp, "output", []):
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        text_out += c.get("text", "")
-            if not text_out:
-                text_out = getattr(resp, "output_text", "") or ""
+            text_out = _parse_responses_text(resp)
             return json.loads(text_out)
 
-        except TypeError as e:
-            last_err = e
+        except TypeError as e_a:
+            # If Path A kw args aren't supported, try Path B
+            last_err = e_a
             try:
-                # -------- Path B: Responses with response_format ----
-                tokens_kw = _responses_tokens_arg()
+                tokens_kw = _responses_tokens_kw()
                 kwargs = {
                     "model": MODEL_NAME,
                     "input": [msg_system, msg_user],
-                    "response_format": {"type": "json_schema", "json_schema": PREDICTION_SCHEMA},
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": SCHEMA_NAME,
+                            "schema": PREDICTION_JSON_SCHEMA,
+                            "strict": STRICT_OUTPUT,
+                        },
+                    },
                     "temperature": 0.2,
                     tokens_kw: 900,
                 }
@@ -215,25 +233,26 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if parsed is not None:
                     return parsed
 
-                text_out = ""
-                for item in getattr(resp, "output", []):
-                    for c in item.get("content", []):
-                        if c.get("type") == "output_text":
-                            text_out += c.get("text", "")
-                if not text_out:
-                    text_out = getattr(resp, "output_text", "") or ""
+                text_out = _parse_responses_text(resp)
                 return json.loads(text_out)
 
-            except TypeError as e2:
-                # -------- Path C: Chat Completions fallback ----------
-                last_err = e2
+            except TypeError as e_b:
+                # Path C: Chat Completions fallback
+                last_err = e_b
                 cc = client.chat.completions.create(
                     model=MODEL_NAME,
                     messages=[
                         {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
-                    response_format={"type": "json_schema", "json_schema": PREDICTION_SCHEMA},
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": SCHEMA_NAME,
+                            "schema": PREDICTION_JSON_SCHEMA,
+                            "strict": STRICT_OUTPUT,
+                        },
+                    },
                     temperature=0.2,
                     max_tokens=900,
                 )
@@ -254,9 +273,14 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     raise RuntimeError(f"Failed to get model response after {MAX_RETRIES} attempts: {last_err}")
 
-
-# ---- Public API --------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------------------------
 def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Entry point used by main.py
+    Returns structured dict matching PREDICTION_JSON_SCHEMA or None if invalid.
+    """
     try:
         payload = {
             "fixture_id": match_data.get("fixture_id"),
@@ -284,6 +308,9 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                      match_data.get("fixture_id"), e)
         return None
 
+# ------------------------------------------------------------------------------
+# Smoke test
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     dummy_match = {
         "fixture_id": 123456,
