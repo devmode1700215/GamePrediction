@@ -11,19 +11,22 @@ from typing import Any, Dict, Tuple, Optional, Iterable
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# ------------------------------------------------------------------------------
+# Boot & logging
+# ------------------------------------------------------------------------------
 load_dotenv()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # ------------------------------------------------------------------------------
-# Config
+# Config (env-driven)
 # ------------------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-mini")
 MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 RETRY_BACKOFF_SEC = float(os.getenv("OPENAI_RETRY_BACKOFF_SEC", "2.0"))
 
-# guardrails used by your insertion logic
+# Odds guardrails (used by your insertion layer, but we also warn here)
 MIN_ODDS = float(os.getenv("PREDICTION_MIN_ODDS", "1.6"))
 MAX_ODDS = float(os.getenv("PREDICTION_MAX_ODDS", "2.3"))
 
@@ -33,7 +36,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------------------------------------------------------
-# Structured Output Schema
+# Structured Output Schema (JSON Schema for model)
 # ------------------------------------------------------------------------------
 SCHEMA_NAME = "MatchPredictions"
 PREDICTION_JSON_SCHEMA = {
@@ -133,7 +136,7 @@ def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     return True, None
 
 # ------------------------------------------------------------------------------
-# Responses API helpers
+# Responses API helpers (robust parsing across SDK versions)
 # ------------------------------------------------------------------------------
 def _supports_arg(fn, name: str) -> bool:
     try:
@@ -146,7 +149,7 @@ def _responses_tokens_kw() -> str:
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _iter_all_values(obj: Any) -> Iterable[Any]:
-    """Depth-first iterator over all nested values of dict/list/objects."""
+    """Depth-first iterator over nested values of dict/list/SDK objects."""
     if isinstance(obj, dict):
         for v in obj.values():
             yield v
@@ -156,7 +159,7 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
             yield v
             yield from _iter_all_values(v)
     else:
-        # SDK objects: try to use model_dump/model_dump_json if present
+        # SDK objects: try model_dump()/dict()
         for attr in ("model_dump", "dict"):
             try:
                 if hasattr(obj, attr):
@@ -166,7 +169,7 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
                     return
             except Exception:
                 pass
-        # Also try accessing common fields
+        # Also probe common attributes
         for name in ("content", "output", "parsed", "text"):
             try:
                 v = getattr(obj, name, None)
@@ -176,15 +179,28 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
             except Exception:
                 pass
 
-def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
-    """Find the first dict that matches our schema shape."""
-    try:
-        # Fast path: already a dict with required keys
-        if isinstance(obj, dict) and "fixture_id" in obj and "predictions" in obj:
+def _deep_find_prediction_obj(obj: Any, require_full: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Find the first dict that matches the expected shape.
+    If require_full=True, require all three markets to be present.
+    """
+    def is_full_schema(d: Dict[str, Any]) -> bool:
+        if not (isinstance(d, dict) and "fixture_id" in d and "predictions" in d and isinstance(d["predictions"], dict)):
+            return False
+        preds = d["predictions"]
+        return all(k in preds for k in ("one_x_two", "btts", "over_2_5"))
+
+    if isinstance(obj, dict):
+        if (is_full_schema(obj) if require_full else ("fixture_id" in obj and "predictions" in obj)):
             return obj
+
+    try:
         for v in _iter_all_values(obj):
-            if isinstance(v, dict) and "fixture_id" in v and "predictions" in v:
-                return v
+            if isinstance(v, dict):
+                if require_full:
+                    if is_full_schema(v): return v
+                else:
+                    if "fixture_id" in v and "predictions" in v: return v
     except Exception:
         pass
     return None
@@ -192,9 +208,8 @@ def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
 def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
     """
     Pull parsed JSON directly from Responses API objects if present,
-    falling back to a deep search through the model dump.
+    falling back to a deep search through a dumped structure.
     """
-    # 1) Prefer explicit parsed payloads (various SDKs expose differently)
     parsed = getattr(resp, "output_parsed", None)
     if parsed is not None:
         return parsed
@@ -204,42 +219,34 @@ def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
         for item in output_list:
             content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
             for chunk in content:
-                if isinstance(chunk, dict):
-                    maybe = chunk.get("parsed", None)
-                else:
-                    maybe = getattr(chunk, "parsed", None)
+                maybe = chunk.get("parsed", None) if isinstance(chunk, dict) else getattr(chunk, "parsed", None)
                 if isinstance(maybe, (dict, list)):
-                    # If it's a list, try to find our target dict inside it
                     if isinstance(maybe, dict):
                         return maybe
-                    if isinstance(maybe, list):
-                        for x in maybe:
-                            if isinstance(x, dict) and "fixture_id" in x and "predictions" in x:
-                                return x
+                    for x in maybe:
+                        if isinstance(x, dict) and "fixture_id" in x and "predictions" in x:
+                            return x
 
-    # 2) Deep search over a dict view of the response
     try:
         if hasattr(resp, "model_dump"):
             dumped = resp.model_dump()
         elif hasattr(resp, "model_dump_json"):
             dumped = json.loads(resp.model_dump_json())
         else:
-            # last resort: try __dict__ then json roundtrip
             dumped = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
     except Exception:
         dumped = None
 
     if dumped is not None:
-        found = _deep_find_prediction_obj(dumped)
+        found = _deep_find_prediction_obj(dumped, require_full=True) or _deep_find_prediction_obj(dumped, require_full=False)
         if found:
             return found
-
     return None
 
 def _parse_responses_text(resp) -> str:
     """
-    Robustly extract text from a Responses response, handling SDK objects.
-    Only aggregates textual outputs; ignores reasoning traces.
+    Extract text from a Responses response, handling SDK objects.
+    Aggregates only textual outputs; ignores reasoning traces.
     """
     txt = getattr(resp, "output_text", None)
     if isinstance(txt, str) and txt.strip():
@@ -257,26 +264,104 @@ def _parse_responses_text(resp) -> str:
     for item in output_list:
         content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
         for chunk in content:
-            if isinstance(chunk, dict):
-                ctype = chunk.get("type")
-                ctext = chunk.get("text", "")
-            else:
-                ctype = getattr(chunk, "type", None)
-                ctext = getattr(chunk, "text", "")
+            ctype = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
+            ctext = chunk.get("text", "") if isinstance(chunk, dict) else getattr(chunk, "text", "")
             if ctype in ("output_text", "summary_text") and isinstance(ctext, str):
                 text_parts.append(ctext)
-
     return "".join(text_parts)
 
 def _extract_json_snippet(s: str) -> str:
     """As a last resort, pull the largest {...} block from a string."""
-    if not isinstance(s, str):
+    if not isinstance(s, str) or not s:
         return ""
-    start = s.find("{")
-    end = s.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return s[start : end + 1]
-    return s.strip()
+    start = s.find("{"); end = s.rfind("}")
+    return s[start:end+1] if (start != -1 and end != -1 and end > start) else s.strip()
+
+# ------------------------------------------------------------------------------
+# Partial repair helpers (if model returns a partial object)
+# ------------------------------------------------------------------------------
+def _missing_markets(data: Dict[str, Any]) -> set:
+    want = {"one_x_two", "btts", "over_2_5"}
+    have = set(data.get("predictions", {}).keys()) if isinstance(data.get("predictions"), dict) else set()
+    return want - have
+
+def _repair_missing_markets(payload: Dict[str, Any], partial: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Ask the model to fill only the missing markets and return the full object.
+    If uncertain, the model should set po_value=false and bankroll_pct=0.
+    """
+    missing = _missing_markets(partial)
+    if not missing:
+        return partial
+
+    repair_instr = (
+        "You previously returned a partial prediction object. "
+        f"The following markets are missing: {', '.join(sorted(missing))}. "
+        "Return the FULL object again, with ALL THREE markets present. "
+        "If uncertain for any market, set po_value=false and bankroll_pct=0 (with a brief rationale). "
+        "Do not change fixture_id. Output must match the JSON schema exactly."
+    )
+
+    msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
+    msg_user = {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": repair_instr},
+            {"type": "input_text", "text": "Original match payload:"},
+            {"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)},
+            {"type": "input_text", "text": "Your previous (partial) result:"},
+            {"type": "input_text", "text": json.dumps(partial, ensure_ascii=False)},
+        ],
+    }
+
+    # Prefer text.format; fall back to response_format; then chat
+    try:
+        tokens_kw = _responses_tokens_kw()
+        resp = client.responses.create(
+            model=MODEL_NAME,
+            input=[msg_system, msg_user],
+            text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+            **{tokens_kw: 900},
+        )
+        fixed = _extract_parsed_from_responses(resp)
+        if fixed: return fixed
+        text_out = _parse_responses_text(resp)
+        if text_out.strip(): return json.loads(text_out)
+    except Exception:
+        pass
+
+    try:
+        tokens_kw = _responses_tokens_kw()
+        resp = client.responses.create(
+            model=MODEL_NAME,
+            input=[msg_system, msg_user],
+            response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+            **{tokens_kw: 900},
+        )
+        fixed = _extract_parsed_from_responses(resp)
+        if fixed: return fixed
+        text_out = _parse_responses_text(resp)
+        if text_out.strip(): return json.loads(text_out)
+    except Exception:
+        pass
+
+    try:
+        cc = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                {"role": "user", "content": repair_instr + "\n\nOriginal payload:\n" + json.dumps(payload, ensure_ascii=False) + "\n\nPartial result:\n" + json.dumps(partial, ensure_ascii=False)},
+            ],
+            response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+            max_tokens=900,
+        )
+        text = cc.choices[0].message.content
+        json_text = _extract_json_snippet(text)
+        if json_text: return json.loads(json_text)
+    except Exception:
+        pass
+
+    return None
 
 # ------------------------------------------------------------------------------
 # Model call (with compat shim across SDKs)
@@ -285,11 +370,10 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls GPT-5 mini with best-available method:
       A) Responses API + text.format (JSON schema w/ name+schema+strict)
-         - if empty/opaque output, *gracefully falls through* to Path B/C
+         (if opaque output, gracefully fall through to B/C)
       B) Responses API + response_format (older)
       C) Chat Completions fallback (with/without response_format)
     """
-    # Use input_text for all content parts
     msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
     msg_user = {
         "role": "user",
@@ -302,103 +386,71 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     last_err: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # ---------------- Path A: Responses with text.format -------------------
+        # ---- A) Responses + text.format ------------------------------------------------
         try:
             tokens_kw = _responses_tokens_kw()
-            kwargs = {
-                "model": MODEL_NAME,
-                "input": [msg_system, msg_user],
-                "text": {
-                    "format": {
-                        "type": "json_schema",
-                        "name": SCHEMA_NAME,
-                        "schema": PREDICTION_JSON_SCHEMA,
-                        "strict": STRICT_OUTPUT,
-                    }
-                },
-                tokens_kw: 900,
-            }
-            resp = client.responses.create(**kwargs)
+            resp = client.responses.create(
+                model=MODEL_NAME,
+                input=[msg_system, msg_user],
+                text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                **{tokens_kw: 900},
+            )
 
             parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None:
-                return parsed
+            if parsed is not None: return parsed
 
             text_out = _parse_responses_text(resp)
-            if text_out.strip():
-                return json.loads(text_out)
+            if text_out.strip(): return json.loads(text_out)
 
-            # No text? Fall through to Path B without raising.
-            logger.debug("Responses text.format returned no text; trying response_format shape...")
-
+            logger.debug("Responses text.format returned no text; trying response_format...")
         except Exception as e_a:
             last_err = e_a
             logger.debug("Path A failed: %s", e_a)
 
-        # ---------------- Path B: Responses with response_format ---------------
+        # ---- B) Responses + response_format --------------------------------------------
         try:
             tokens_kw = _responses_tokens_kw()
-            kwargs = {
-                "model": MODEL_NAME,
-                "input": [msg_system, msg_user],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": SCHEMA_NAME,
-                        "schema": PREDICTION_JSON_SCHEMA,
-                        "strict": STRICT_OUTPUT,
-                    },
-                },
-                tokens_kw: 900,
-            }
-            resp = client.responses.create(**kwargs)
+            resp = client.responses.create(
+                model=MODEL_NAME,
+                input=[msg_system, msg_user],
+                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                **{tokens_kw: 900},
+            )
 
             parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None:
-                return parsed
+            if parsed is not None: return parsed
 
             text_out = _parse_responses_text(resp)
-            if text_out.strip():
-                return json.loads(text_out)
+            if text_out.strip(): return json.loads(text_out)
 
             logger.debug("Responses response_format returned no text; trying Chat Completions...")
-
         except Exception as e_b:
             last_err = e_b
             logger.debug("Path B failed: %s", e_b)
 
-        # ---------------- Path C: Chat Completions fallback --------------------
+        # ---- C1) Chat Completions with response_format ---------------------------------
         try:
-            # Try with response_format first (newer servers)
             cc = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": SCHEMA_NAME,
-                        "schema": PREDICTION_JSON_SCHEMA,
-                        "strict": STRICT_OUTPUT,
-                    },
-                },
+                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
                 max_tokens=900,
             )
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
-            if json_text:
-                return json.loads(json_text)
+            if json_text: return json.loads(json_text)
         except TypeError as e_c1:
             last_err = e_c1
-            logger.debug("Chat Completions with response_format not supported: %s", e_c1)
+            logger.debug("Chat Completions response_format not supported: %s", e_c1)
         except Exception as e_c2:
             last_err = e_c2
             logger.debug("Chat Completions with response_format failed: %s", e_c2)
 
+        # ---- C2) Oldest Chat Completions path (instruction-only JSON) ------------------
         try:
-            # Oldest path: instruct-only JSON
             sys_instr = SYSTEM_INSTRUCTIONS + " IMPORTANT: Reply ONLY with JSON that matches the schema keys."
             cc = client.chat.completions.create(
                 model=MODEL_NAME,
@@ -410,19 +462,15 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
-            if json_text:
-                return json.loads(json_text)
+            if json_text: return json.loads(json_text)
         except Exception as e_c3:
             last_err = e_c3
             logger.debug("Chat Completions fallback failed: %s", e_c3)
 
-        # Retry loop backoff
+        # Retry w/ backoff
         if attempt < MAX_RETRIES:
             sleep_for = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
-            logger.warning(
-                "Model call failed (attempt %d/%d): %s. Retrying in %.1fs",
-                attempt, MAX_RETRIES, last_err, sleep_for
-            )
+            logger.warning("Model call failed (attempt %d/%d): %s. Retrying in %.1fs", attempt, MAX_RETRIES, last_err, sleep_for)
             time.sleep(sleep_for)
         else:
             break
@@ -434,7 +482,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Entry point used by main.py
+    Entry point used by main.py.
     Returns structured dict matching PREDICTION_JSON_SCHEMA or None if invalid.
     """
     try:
@@ -451,6 +499,15 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         }
 
         result = _call_model(payload)
+
+        # If the model returned a partial object, attempt a one-shot repair
+        missing = _missing_markets(result)
+        if missing:
+            logger.warning("⚠️ Partial prediction detected; missing markets: %s. Attempting repair...", ", ".join(sorted(missing)))
+            repaired = _repair_missing_markets(payload, result)
+            if repaired:
+                result = repaired
+
         ok, err = _validate_full_response(result)
         if not ok:
             logger.error("❌ Invalid prediction shape: %s", err)
@@ -460,12 +517,11 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return result
 
     except Exception as e:
-        logger.error("❌ Failed to get prediction for fixture %s: %s",
-                     match_data.get("fixture_id"), e)
+        logger.error("❌ Failed to get prediction for fixture %s: %s", match_data.get("fixture_id"), e)
         return None
 
 # ------------------------------------------------------------------------------
-# Smoke test
+# Smoke test (run: python utils/get_prediction.py)
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     dummy_match = {
