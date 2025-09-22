@@ -280,9 +280,8 @@ def _chat_tokens_kwargs(n: int = 900) -> dict:
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls GPT-5 mini with best-available method:
-      A) Responses API + text.format (JSON schema)
-         (if opaque output, fall through to B/C)
-      B) Responses API + response_format (older)
+      A) Responses API + text.format (JSON schema) — only if supported
+      B) Responses API + response_format (older) — only if supported
       C) Chat Completions fallback (with/without response_format)
     """
     msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
@@ -295,53 +294,58 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     last_err: Optional[Exception] = None
+    has_text_format = _responses_supports_param("text")
+    has_resp_format = _responses_supports_param("response_format")
+    tokens_kw = _responses_tokens_kw()
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # ---- A) Responses + text.format ------------------------------------------------
-        try:
-            tokens_kw = _responses_tokens_kw()
-            resp = client.responses.create(
-                model=MODEL_NAME,
-                input=[msg_system, msg_user],
-                text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                **{tokens_kw: 900},
-            )
+        # ---- A) Responses + text.format (only if supported) ----------------------------
+        if has_text_format:
+            try:
+                resp = client.responses.create(
+                    model=MODEL_NAME,
+                    input=[msg_system, msg_user],
+                    text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                    **{tokens_kw: 900},
+                )
+                parsed = _extract_parsed_from_responses(resp)
+                if parsed is not None:
+                    return parsed
 
-            parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None:
-                return parsed
+                text_out = _parse_responses_text(resp)
+                if text_out.strip():
+                    return json.loads(text_out)
 
-            text_out = _parse_responses_text(resp)
-            if text_out.strip():
-                return json.loads(text_out)
+                logger.debug("Responses text.format returned no text; will try other paths...")
+            except Exception as e_a:
+                last_err = e_a
+                logger.debug("Responses text.format path failed: %s", e_a)
+        else:
+            logger.debug("Responses 'text' kw not supported; skipping text.format path.")
 
-            logger.debug("Responses text.format returned no text; trying response_format...")
-        except Exception as e_a:
-            last_err = e_a
-            logger.debug("Path A failed: %s", e_a)
+        # ---- B) Responses + response_format (only if supported) ------------------------
+        if has_resp_format:
+            try:
+                resp = client.responses.create(
+                    model=MODEL_NAME,
+                    input=[msg_system, msg_user],
+                    response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                    **{tokens_kw: 900},
+                )
+                parsed = _extract_parsed_from_responses(resp)
+                if parsed is not None:
+                    return parsed
 
-        # ---- B) Responses + response_format --------------------------------------------
-        try:
-            tokens_kw = _responses_tokens_kw()
-            resp = client.responses.create(
-                model=MODEL_NAME,
-                input=[msg_system, msg_user],
-                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                **{tokens_kw: 900},
-            )
+                text_out = _parse_responses_text(resp)
+                if text_out.strip():
+                    return json.loads(text_out)
 
-            parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None:
-                return parsed
-
-            text_out = _parse_responses_text(resp)
-            if text_out.strip():
-                return json.loads(text_out)
-
-            logger.debug("Responses response_format returned no text; trying Chat Completions...")
-        except Exception as e_b:
-            last_err = e_b
-            logger.debug("Path B failed: %s", e_b)
+                logger.debug("Responses response_format returned no text; will try Chat Completions...")
+            except Exception as e_b:
+                last_err = e_b
+                logger.debug("Responses response_format path failed: %s", e_b)
+        else:
+            logger.debug("Responses 'response_format' kw not supported; skipping response_format path.")
 
         # ---- C1) Chat Completions with response_format ---------------------------------
         try:
@@ -360,7 +364,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return json.loads(json_text)
         except TypeError as e_c1:
             last_err = e_c1
-            logger.debug("Chat Completions response_format not supported: %s", e_c1)
+            logger.debug("Chat Completions with response_format not supported: %s", e_c1)
         except Exception as e_c2:
             last_err = e_c2
             logger.debug("Chat Completions with response_format failed: %s", e_c2)
