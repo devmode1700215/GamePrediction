@@ -36,9 +36,9 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------------------------------------------------------
-# Structured Output Schema (JSON Schema for model)
+# Structured Output Schema (JSON Schema for model) — ONLY Over/Under 2.5
 # ------------------------------------------------------------------------------
-SCHEMA_NAME = "MatchPredictions"
+SCHEMA_NAME = "OverUnder25Prediction"
 PREDICTION_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -48,34 +48,6 @@ PREDICTION_JSON_SCHEMA = {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "one_x_two": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "prediction": {"type": "string", "enum": ["Home", "Draw", "Away"]},
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 100},
-                        "edge": {"type": "number"},
-                        "po_value": {"type": "boolean"},
-                        "odds": {"type": "number"},
-                        "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
-                        "rationale": {"type": "string"}
-                    },
-                    "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
-                },
-                "btts": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "prediction": {"type": "string", "enum": ["Yes", "No"]},
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 100},
-                        "edge": {"type": "number"},
-                        "po_value": {"type": "boolean"},
-                        "odds": {"type": "number"},
-                        "bankroll_pct": {"type": "number", "minimum": 0, "maximum": 10},
-                        "rationale": {"type": "string"}
-                    },
-                    "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
-                },
                 "over_2_5": {
                     "type": "object",
                     "additionalProperties": False,
@@ -91,7 +63,7 @@ PREDICTION_JSON_SCHEMA = {
                     "required": ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
                 }
             },
-            "required": ["one_x_two", "btts", "over_2_5"]
+            "required": ["over_2_5"]
         }
     },
     "required": ["fixture_id", "predictions"]
@@ -101,38 +73,38 @@ STRICT_OUTPUT = True
 SYSTEM_INSTRUCTIONS = (
     "You are an expert football betting analyst. "
     "Given structured match data (teams, form, injuries, H2H, league, venue, odds), "
-    "evaluate three markets (1X2, BTTS, Over/Under 2.5). "
+    "evaluate ONLY the Over/Under 2.5 goals market. "
     "Calibrate probabilities, compute edge vs. listed odds, and set po_value true only for positive EV "
-    "within the provided odds range. Keep bankroll_pct modest (0.25–1.5) unless edge is exceptional. "
-    "Return ONLY JSON conforming to the provided schema. Never omit any market."
+    f"within the provided odds guardrails ({MIN_ODDS}–{MAX_ODDS}). "
+    "Keep bankroll_pct modest (0.25–1.5) unless edge is exceptional. "
+    "Return ONLY JSON conforming to the provided schema."
 )
 
 # ------------------------------------------------------------------------------
-# Validation helpers
+# Validation helpers (single-market)
 # ------------------------------------------------------------------------------
-def _validate_prediction_block(name: str, block: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+def _validate_prediction_block(block: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     required = ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
     missing = [k for k in required if k not in block]
     if missing:
-        return False, f"{name}: missing {missing}"
+        return False, f"over_2_5: missing {missing}"
     try:
         if not (MIN_ODDS <= float(block["odds"]) <= MAX_ODDS):
-            logger.warning("⚠️ %s odds out of range: %.3f (allowed %.2f–%.2f)",
-                           name, float(block["odds"]), MIN_ODDS, MAX_ODDS)
+            logger.warning("⚠️ over_2_5 odds out of range: %.3f (allowed %.2f–%.2f)",
+                           float(block["odds"]), MIN_ODDS, MAX_ODDS)
     except Exception:
-        logger.warning("⚠️ %s has non-numeric odds: %r", name, block.get("odds"))
+        logger.warning("⚠️ over_2_5 has non-numeric odds: %r", block.get("odds"))
     return True, None
 
 def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     if "fixture_id" not in data or "predictions" not in data:
         return False, "Missing top-level fields"
     preds = data["predictions"]
-    for k in ["one_x_two", "btts", "over_2_5"]:
-        if k not in preds:
-            return False, f"Missing market {k}"
-        ok, err = _validate_prediction_block(k, preds[k])
-        if not ok:
-            return False, err
+    if "over_2_5" not in preds:
+        return False, "Missing market over_2_5"
+    ok, err = _validate_prediction_block(preds["over_2_5"])
+    if not ok:
+        return False, err
     return True, None
 
 # ------------------------------------------------------------------------------
@@ -145,9 +117,11 @@ def _supports_arg(fn, name: str) -> bool:
         return False
 
 def _responses_tokens_kw() -> str:
+    """Return the correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _iter_all_values(obj: Any) -> Iterable[Any]:
+    """Depth-first iterator over nested values of dict/list/SDK objects."""
     if isinstance(obj, dict):
         for v in obj.values():
             yield v
@@ -157,6 +131,7 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
             yield v
             yield from _iter_all_values(v)
     else:
+        # SDK objects: try model_dump()/dict()
         for attr in ("model_dump", "dict"):
             try:
                 if hasattr(obj, attr):
@@ -166,6 +141,7 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
                     return
             except Exception:
                 pass
+        # Probe common attributes
         for name in ("content", "output", "parsed", "text"):
             try:
                 v = getattr(obj, name, None)
@@ -175,29 +151,22 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
             except Exception:
                 pass
 
-def _deep_find_prediction_obj(obj: Any, require_full: bool = True) -> Optional[Dict[str, Any]]:
-    def is_full_schema(d: Dict[str, Any]) -> bool:
-        if not (isinstance(d, dict) and "fixture_id" in d and "predictions" in d and isinstance(d["predictions"], dict)):
-            return False
-        preds = d["predictions"]
-        return all(k in preds for k in ("one_x_two", "btts", "over_2_5"))
-
+def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
+    """Find a dict with fixture_id + predictions.over_2_5."""
     if isinstance(obj, dict):
-        if (is_full_schema(obj) if require_full else ("fixture_id" in obj and "predictions" in obj)):
+        if "fixture_id" in obj and isinstance(obj.get("predictions"), dict) and "over_2_5" in obj["predictions"]:
             return obj
-
     try:
         for v in _iter_all_values(obj):
             if isinstance(v, dict):
-                if require_full:
-                    if is_full_schema(v): return v
-                else:
-                    if "fixture_id" in v and "predictions" in v: return v
+                if "fixture_id" in v and isinstance(v.get("predictions"), dict) and "over_2_5" in v["predictions"]:
+                    return v
     except Exception:
         pass
     return None
 
 def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
+    """Pull parsed JSON from Responses API objects; deep-search if needed."""
     parsed = getattr(resp, "output_parsed", None)
     if parsed is not None:
         return parsed
@@ -208,9 +177,9 @@ def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
             content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
             for chunk in content:
                 maybe = chunk.get("parsed", None) if isinstance(chunk, dict) else getattr(chunk, "parsed", None)
-                if isinstance(maybe, (dict, list)):
-                    if isinstance(maybe, dict):
-                        return maybe
+                if isinstance(maybe, dict):
+                    return maybe
+                if isinstance(maybe, list):
                     for x in maybe:
                         if isinstance(x, dict) and "fixture_id" in x and "predictions" in x:
                             return x
@@ -226,17 +195,18 @@ def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
         dumped = None
 
     if dumped is not None:
-        found = _deep_find_prediction_obj(dumped, require_full=True) or _deep_find_prediction_obj(dumped, require_full=False)
+        found = _deep_find_prediction_obj(dumped)
         if found:
             return found
     return None
 
 def _parse_responses_text(resp) -> str:
+    """Extract text from a Responses response, handling SDK objects."""
     txt = getattr(resp, "output_text", None)
     if isinstance(txt, str) and txt.strip():
         return txt
 
-    text_parts = []
+    parts = []
     output_list = getattr(resp, "output", None)
     if output_list is None:
         msg = getattr(resp, "message", None)
@@ -251,163 +221,45 @@ def _parse_responses_text(resp) -> str:
             ctype = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
             ctext = chunk.get("text", "") if isinstance(chunk, dict) else getattr(chunk, "text", "")
             if ctype in ("output_text", "summary_text") and isinstance(ctext, str):
-                text_parts.append(ctext)
-    return "".join(text_parts)
+                parts.append(ctext)
+    return "".join(parts)
 
 def _extract_json_snippet(s: str) -> str:
+    """As a last resort, pull the largest {...} block from a string."""
     if not isinstance(s, str) or not s:
         return ""
     start = s.find("{"); end = s.rfind("}")
     return s[start:end+1] if (start != -1 and end != -1 and end > start) else s.strip()
 
 # ------------------------------------------------------------------------------
-# Partial repair + backstop
+# Backstop (if model returns nothing or partial)
 # ------------------------------------------------------------------------------
-def _missing_markets(data: Dict[str, Any]) -> set:
-    want = {"one_x_two", "btts", "over_2_5"}
-    have = set(data.get("predictions", {}).keys()) if isinstance(data.get("predictions"), dict) else set()
-    return want - have
-
-def _default_stub_for_market(market: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Best-effort odds from payload; fall back to MIN_ODDS
+def _default_stub_over25(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Try to use odds from payload; else fall back to MIN_ODDS
     def _num(x):
         try:
             return float(x)
         except Exception:
             return None
-
-    if market == "one_x_two":
-        # Prefer Draw odds if present; else any available; else MIN_ODDS
-        d = payload.get("odds", {}).get("one_x_two", {}) if isinstance(payload.get("odds", {}).get("one_x_two", {}), dict) else {}
-        odds = _num(d.get("Draw")) or _num(d.get("Home")) or _num(d.get("Away")) or MIN_ODDS
-        return {
-            "prediction": "Draw",
-            "confidence": 0,
-            "edge": 0,
-            "po_value": False,
-            "odds": odds,
-            "bankroll_pct": 0,
-            "rationale": "Stub filled due to missing market; no value."
-        }
-    if market == "btts":
-        d = payload.get("odds", {}).get("btts", {}) if isinstance(payload.get("odds", {}).get("btts", {}), dict) else {}
-        odds = _num(d.get("No")) or _num(d.get("Yes")) or MIN_ODDS
-        return {
-            "prediction": "No",
-            "confidence": 0,
-            "edge": 0,
-            "po_value": False,
-            "odds": odds,
-            "bankroll_pct": 0,
-            "rationale": "Stub filled due to missing market; no value."
-        }
-    if market == "over_2_5":
-        # Many feeds only include Over price; use it if present; else MIN_ODDS
-        odds = _num(payload.get("odds", {}).get("over_2_5")) or MIN_ODDS
-        return {
-            "prediction": "Under",
-            "confidence": 0,
-            "edge": 0,
-            "po_value": False,
-            "odds": odds,
-            "bankroll_pct": 0,
-            "rationale": "Stub filled due to missing market; no value."
-        }
-    # Fallback (shouldn't hit)
+    odds = _num(payload.get("odds", {}).get("over_2_5")) or MIN_ODDS
     return {
         "prediction": "Under",
         "confidence": 0,
         "edge": 0,
         "po_value": False,
-        "odds": MIN_ODDS,
+        "odds": odds,
         "bankroll_pct": 0,
-        "rationale": "Stub."
+        "rationale": "Stub filled due to missing market; no value."
     }
 
-def _apply_backstop_fill(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_backstop_if_missing(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(data)  # shallow copy
     preds = dict(data.get("predictions") or {})
-    missing = _missing_markets({"predictions": preds})
-    if missing:
-        logger.warning("⚠️ Backstop fill for missing markets: %s", ", ".join(sorted(missing)))
-    for m in missing:
-        preds[m] = _default_stub_for_market(m, payload)
+    if "over_2_5" not in preds:
+        logger.warning("⚠️ Backstop fill for missing market: over_2_5")
+        preds["over_2_5"] = _default_stub_over25(payload)
     data["predictions"] = preds
     return data
-
-def _repair_missing_markets(payload: Dict[str, Any], partial: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    missing = _missing_markets(partial)
-    if not missing:
-        return partial
-
-    repair_instr = (
-        "You previously returned a partial prediction object. "
-        f"The following markets are missing: {', '.join(sorted(missing))}. "
-        "Return the FULL object again, with ALL THREE markets present. "
-        "If uncertain for any market, set po_value=false and bankroll_pct=0 (with a brief rationale). "
-        "Do not change fixture_id. Output must match the JSON schema exactly."
-    )
-
-    msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
-    msg_user = {
-        "role": "user",
-        "content": [
-            {"type": "input_text", "text": repair_instr},
-            {"type": "input_text", "text": "Original match payload:"},
-            {"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)},
-            {"type": "input_text", "text": "Your previous (partial) result:"},
-            {"type": "input_text", "text": json.dumps(partial, ensure_ascii=False)},
-        ],
-    }
-
-    # Prefer text.format; fall back to response_format; then chat
-    try:
-        tokens_kw = _responses_tokens_kw()
-        resp = client.responses.create(
-            model=MODEL_NAME,
-            input=[msg_system, msg_user],
-            text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-            **{tokens_kw: 900},
-        )
-        fixed = _extract_parsed_from_responses(resp)
-        if fixed: return fixed
-        text_out = _parse_responses_text(resp)
-        if text_out.strip(): return json.loads(text_out)
-    except Exception:
-        pass
-
-    try:
-        tokens_kw = _responses_tokens_kw()
-        resp = client.responses.create(
-            model=MODEL_NAME,
-            input=[msg_system, msg_user],
-            response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-            **{tokens_kw: 900},
-        )
-        fixed = _extract_parsed_from_responses(resp)
-        if fixed: return fixed
-        text_out = _parse_responses_text(resp)
-        if text_out.strip(): return json.loads(text_out)
-    except Exception:
-        pass
-
-    try:
-        cc = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                {"role": "user", "content": repair_instr + "\n\nOriginal payload:\n" + json.dumps(payload, ensure_ascii=False) + "\n\nPartial result:\n" + json.dumps(partial, ensure_ascii=False)},
-            ],
-            response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-            max_tokens=900,
-        )
-        text = cc.choices[0].message.content
-        json_text = _extract_json_snippet(text)
-        if json_text: return json.loads(json_text)
-    except Exception:
-        pass
-
-    return None
 
 # ------------------------------------------------------------------------------
 # Model call (with compat shim across SDKs)
@@ -443,10 +295,12 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
 
             parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None: return parsed
+            if parsed is not None:
+                return parsed
 
             text_out = _parse_responses_text(resp)
-            if text_out.strip(): return json.loads(text_out)
+            if text_out.strip():
+                return json.loads(text_out)
 
             logger.debug("Responses text.format returned no text; trying response_format...")
         except Exception as e_a:
@@ -464,10 +318,12 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
 
             parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None: return parsed
+            if parsed is not None:
+                return parsed
 
             text_out = _parse_responses_text(resp)
-            if text_out.strip(): return json.loads(text_out)
+            if text_out.strip():
+                return json.loads(text_out)
 
             logger.debug("Responses response_format returned no text; trying Chat Completions...")
         except Exception as e_b:
@@ -487,7 +343,8 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
-            if json_text: return json.loads(json_text)
+            if json_text:
+                return json.loads(json_text)
         except TypeError as e_c1:
             last_err = e_c1
             logger.debug("Chat Completions response_format not supported: %s", e_c1)
@@ -508,7 +365,8 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
-            if json_text: return json.loads(json_text)
+            if json_text:
+                return json.loads(json_text)
         except Exception as e_c3:
             last_err = e_c3
             logger.debug("Chat Completions fallback failed: %s", e_c3)
@@ -524,12 +382,12 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     raise RuntimeError(f"Failed to get model response after {MAX_RETRIES} attempts: {last_err}")
 
 # ------------------------------------------------------------------------------
-# Public API
+# Public API (ONLY Over/Under 2.5)
 # ------------------------------------------------------------------------------
 def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Entry point used by main.py.
-    Returns structured dict matching PREDICTION_JSON_SCHEMA or None if invalid.
+    Returns an object with ONLY the over_2_5 market.
     """
     try:
         payload = {
@@ -546,18 +404,12 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         result = _call_model(payload)
 
-        # If the model returned a partial object, try one-shot repair
-        missing = _missing_markets(result)
-        if missing:
-            logger.warning("⚠️ Partial prediction detected; missing markets: %s. Attempting repair...", ", ".join(sorted(missing)))
-            repaired = _repair_missing_markets(payload, result)
-            if repaired:
-                result = repaired
+        # Final backstop: still missing? Fill stub to satisfy schema and proceed.
+        if not isinstance(result, dict):
+            logger.warning("⚠️ Model returned non-dict; applying backstop.")
+            result = {"fixture_id": match_data.get("fixture_id", 0), "predictions": {}}
 
-        # Final backstop: still missing? Fill stubs to satisfy schema and proceed.
-        missing = _missing_markets(result)
-        if missing:
-            result = _apply_backstop_fill(payload, result)
+        result = _apply_backstop_if_missing(payload, result)
 
         ok, err = _validate_full_response(result)
         if not ok:
