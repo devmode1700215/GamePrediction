@@ -149,10 +149,26 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     2) Responses API with response_format (older)
     3) Chat Completions fallback (oldest)
     """
-    user_content = [
-        {"type": "text", "text": "Match data JSON follows."},
-        {"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}
-    ]
+    import inspect
+
+    def _supports_arg(fn, name: str) -> bool:
+        try:
+            return name in inspect.signature(fn).parameters
+        except Exception:
+            return False
+
+    def _responses_tokens_arg() -> str:
+        return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
+
+    # ✅ Use input_text everywhere (no "text" type)
+    msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
+    msg_user = {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Match data JSON follows."},
+            {"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)},
+        ],
+    }
 
     last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -161,10 +177,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             tokens_kw = _responses_tokens_arg()
             kwargs = {
                 "model": MODEL_NAME,
-                "input": [
-                    {"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCTIONS}]},
-                    {"role": "user", "content": user_content},
-                ],
+                "input": [msg_system, msg_user],
                 "text": {"format": {"type": "json_schema", "json_schema": PREDICTION_SCHEMA}},
                 "temperature": 0.2,
                 tokens_kw: 900,
@@ -185,16 +198,13 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             return json.loads(text_out)
 
         except TypeError as e:
-            # Try Path B if text.format isn't supported
             last_err = e
             try:
+                # -------- Path B: Responses with response_format ----
                 tokens_kw = _responses_tokens_arg()
                 kwargs = {
                     "model": MODEL_NAME,
-                    "input": [
-                        {"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCTIONS}]},
-                        {"role": "user", "content": user_content},
-                    ],
+                    "input": [msg_system, msg_user],
                     "response_format": {"type": "json_schema", "json_schema": PREDICTION_SCHEMA},
                     "temperature": 0.2,
                     tokens_kw: 900,
@@ -223,7 +233,6 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                         {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
-                    # many older SDKs accept response_format here too; if not, the model still tries to return JSON
                     response_format={"type": "json_schema", "json_schema": PREDICTION_SCHEMA},
                     temperature=0.2,
                     max_tokens=900,
@@ -235,13 +244,16 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             last_err = e
             if attempt < MAX_RETRIES:
                 sleep_for = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
-                logger.warning("Model call failed (attempt %d/%d): %s. Retrying in %.1fs",
-                               attempt, MAX_RETRIES, e, sleep_for)
+                logger.warning(
+                    "Model call failed (attempt %d/%d): %s. Retrying in %.1fs",
+                    attempt, MAX_RETRIES, e, sleep_for
+                )
                 time.sleep(sleep_for)
             else:
                 break
 
     raise RuntimeError(f"Failed to get model response after {MAX_RETRIES} attempts: {last_err}")
+
 
 # ---- Public API --------------------------------------------------------------
 def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
