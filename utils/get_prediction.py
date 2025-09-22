@@ -239,34 +239,6 @@ def _extract_json_snippet(s: str) -> str:
     return s[start:end+1] if (start != -1 and end != -1 and end > start) else s.strip()
 
 # ------------------------------------------------------------------------------
-# Chat Completions helpers (support message.parsed)
-# ------------------------------------------------------------------------------
-def _extract_from_chat(cc) -> Optional[Dict[str, Any]]:
-    """
-    Handle both content and parsed payloads from Chat Completions.
-    """
-    try:
-        choices = getattr(cc, "choices", []) or []
-        for ch in choices:
-            msg = getattr(ch, "message", None)
-            if msg is None:
-                continue
-            # Newer SDKs: parsed JSON lives here when response_format=json_schema
-            parsed = getattr(msg, "parsed", None)
-            if isinstance(parsed, dict):
-                return parsed
-            # Fallback to text content
-            content = getattr(msg, "content", None)
-            if isinstance(content, str) and content.strip():
-                try:
-                    return json.loads(_extract_json_snippet(content))
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return None
-
-# ------------------------------------------------------------------------------
 # Backstop (if model returns nothing or partial)
 # ------------------------------------------------------------------------------
 def _default_stub_over25(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -297,25 +269,14 @@ def _apply_backstop_if_missing(payload: Dict[str, Any], data: Dict[str, Any]) ->
     return data
 
 # ------------------------------------------------------------------------------
-# Chat tokens shim (newer models require max_completion_tokens)
-# ------------------------------------------------------------------------------
-def _chat_tokens_kwargs(n: int = 900) -> dict:
-    try:
-        if "max_completion_tokens" in inspect.signature(client.chat.completions.create).parameters:
-            return {"max_completion_tokens": n}
-    except Exception:
-        pass
-    return {"max_tokens": n}
-
-# ------------------------------------------------------------------------------
-# Model call (with capability checks per SDK) — explicit errors per path
+# Model call (Responses API only; no Chat fallback)
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls GPT-5 mini with best-available method:
-      A) Responses API + text.format (JSON schema) — only if supported
-      B) Responses API + response_format (older) — only if supported
-      C) Chat Completions fallback (with/without response_format)
+    Calls GPT-5 mini using Responses API only.
+      A) text.format (JSON schema) if supported
+      B) response_format (older) if supported
+    If both fail after retries, returns an empty predictions shell to be backstopped.
     """
     msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
     msg_user = {
@@ -339,7 +300,14 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 resp = client.responses.create(
                     model=MODEL_NAME,
                     input=[msg_system, msg_user],
-                    text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": SCHEMA_NAME,
+                            "schema": PREDICTION_JSON_SCHEMA,
+                            "strict": STRICT_OUTPUT,
+                        }
+                    },
                     **{tokens_kw: 900},
                 )
                 parsed = _extract_parsed_from_responses(resp)
@@ -365,7 +333,14 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 resp = client.responses.create(
                     model=MODEL_NAME,
                     input=[msg_system, msg_user],
-                    response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": SCHEMA_NAME,
+                            "schema": PREDICTION_JSON_SCHEMA,
+                            "strict": STRICT_OUTPUT,
+                        },
+                    },
                     **{tokens_kw: 900},
                 )
                 parsed = _extract_parsed_from_responses(resp)
@@ -385,53 +360,20 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             logger.debug("Responses 'response_format' kw not supported; skipping response_format path.")
 
-        # ---- C1) Chat Completions with response_format ---------------------------------
-        try:
-            cc = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                **_chat_tokens_kwargs(900),
-            )
-            parsed = _extract_from_chat(cc)
-            if parsed is not None:
-                return parsed
-            last_err = RuntimeError("Chat with response_format returned empty output (no parsed/content).")
-        except TypeError as e_c1:
-            last_err = e_c1
-        except Exception as e_c2:
-            last_err = e_c2
-
-        # ---- C2) Oldest Chat Completions path (instruction-only JSON) ------------------
-        try:
-            sys_instr = SYSTEM_INSTRUCTIONS + " IMPORTANT: Reply ONLY with JSON that matches the schema keys."
-            cc = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": sys_instr},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                **_chat_tokens_kwargs(900),
-            )
-            parsed = _extract_from_chat(cc)
-            if parsed is not None:
-                return parsed
-            last_err = RuntimeError("Chat fallback returned empty output (no parsed/content).")
-        except Exception as e_c3:
-            last_err = e_c3
-
         # Retry w/ backoff
         if attempt < MAX_RETRIES:
             sleep_for = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
-            logger.warning("Model call failed (attempt %d/%d): %s. Retrying in %.1fs", attempt, MAX_RETRIES, last_err, sleep_for)
+            logger.warning(
+                "Model call failed (attempt %d/%d): %s. Retrying in %.1fs",
+                attempt, MAX_RETRIES, last_err, sleep_for
+            )
             time.sleep(sleep_for)
         else:
             break
 
-    raise RuntimeError(f"Failed to get model response after {MAX_RETRIES} attempts: {last_err}")
+    # After all attempts failed: return an empty shell; the caller will backstop it.
+    logger.error("Exhausted model attempts; degrading to stub for fixture %s", payload.get("fixture_id"))
+    return {"fixture_id": payload.get("fixture_id", 0), "predictions": {}}
 
 # ------------------------------------------------------------------------------
 # Public API (ONLY Over/Under 2.5)
@@ -463,21 +405,19 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         result = _call_model(payload)
 
-        # If the model returned non-dict or missing, apply backstop
+        # Ensure correct fixture_id shape
         if not isinstance(result, dict):
             logger.warning("⚠️ Model returned non-dict; applying backstop.")
             result = {"fixture_id": fixture_id, "predictions": {}}
-
-        # Ensure correct fixture_id shape
         if not isinstance(result.get("fixture_id"), int):
             result["fixture_id"] = fixture_id
 
-        # Final backstop: still missing? Fill stub and proceed.
+        # Final backstop: fill stub if missing
         result = _apply_backstop_if_missing(payload, result)
 
         ok, err = _validate_full_response(result)
         if not ok:
-            logger.error("❌ Invalid prediction shape: %s", err)
+            logger.error("❌ Invalid prediction shape after backstop: %s", err)
             return None
 
         logger.info("✅ Prediction ready for fixture %s", result.get("fixture_id"))
