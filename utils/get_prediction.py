@@ -122,6 +122,13 @@ def _responses_tokens_kw() -> str:
     """Correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
+def _responses_supports_param(name: str) -> bool:
+    """Return True if client.responses.create supports a given kwarg."""
+    try:
+        return name in inspect.signature(client.responses.create).parameters
+    except Exception:
+        return False
+
 def _iter_all_values(obj: Any) -> Iterable[Any]:
     """Depth-first iterator over nested values of dict/list/SDK objects."""
     if isinstance(obj, dict):
@@ -275,7 +282,7 @@ def _chat_tokens_kwargs(n: int = 900) -> dict:
     return {"max_tokens": n}
 
 # ------------------------------------------------------------------------------
-# Model call (with compat shim across SDKs)
+# Model call (with capability checks per SDK)
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
