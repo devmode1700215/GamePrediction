@@ -6,7 +6,7 @@ import json
 import time
 import logging
 import inspect
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, Iterable
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -133,7 +133,7 @@ def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     return True, None
 
 # ------------------------------------------------------------------------------
-# Responses API parsing helpers
+# Responses API helpers
 # ------------------------------------------------------------------------------
 def _supports_arg(fn, name: str) -> bool:
     try:
@@ -145,30 +145,95 @@ def _responses_tokens_kw() -> str:
     """Return the correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
+def _iter_all_values(obj: Any) -> Iterable[Any]:
+    """Depth-first iterator over all nested values of dict/list/objects."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield v
+            yield from _iter_all_values(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield v
+            yield from _iter_all_values(v)
+    else:
+        # SDK objects: try to use model_dump/model_dump_json if present
+        for attr in ("model_dump", "dict"):
+            try:
+                if hasattr(obj, attr):
+                    res = getattr(obj, attr)()
+                    yield res
+                    yield from _iter_all_values(res)
+                    return
+            except Exception:
+                pass
+        # Also try accessing common fields
+        for name in ("content", "output", "parsed", "text"):
+            try:
+                v = getattr(obj, name, None)
+                if v is not None:
+                    yield v
+                    yield from _iter_all_values(v)
+            except Exception:
+                pass
+
+def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
+    """Find the first dict that matches our schema shape."""
+    try:
+        # Fast path: already a dict with required keys
+        if isinstance(obj, dict) and "fixture_id" in obj and "predictions" in obj:
+            return obj
+        for v in _iter_all_values(obj):
+            if isinstance(v, dict) and "fixture_id" in v and "predictions" in v:
+                return v
+    except Exception:
+        pass
+    return None
+
 def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
     """
     Pull parsed JSON directly from Responses API objects if present,
-    even when not exposed via `output_parsed`.
+    falling back to a deep search through the model dump.
     """
+    # 1) Prefer explicit parsed payloads (various SDKs expose differently)
     parsed = getattr(resp, "output_parsed", None)
     if parsed is not None:
         return parsed
 
     output_list = getattr(resp, "output", None)
-    if not output_list:
-        return None
-
-    for item in output_list:
-        content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
-        for chunk in content:
-            # chunk may be dict or SDK object
-            if isinstance(chunk, dict):
-                if "parsed" in chunk and isinstance(chunk["parsed"], (dict, list)):
-                    return chunk["parsed"]
-            else:
-                maybe = getattr(chunk, "parsed", None)
+    if output_list:
+        for item in output_list:
+            content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
+            for chunk in content:
+                if isinstance(chunk, dict):
+                    maybe = chunk.get("parsed", None)
+                else:
+                    maybe = getattr(chunk, "parsed", None)
                 if isinstance(maybe, (dict, list)):
-                    return maybe
+                    # If it's a list, try to find our target dict inside it
+                    if isinstance(maybe, dict):
+                        return maybe
+                    if isinstance(maybe, list):
+                        for x in maybe:
+                            if isinstance(x, dict) and "fixture_id" in x and "predictions" in x:
+                                return x
+
+    # 2) Deep search over a dict view of the response
+    try:
+        if hasattr(resp, "model_dump"):
+            dumped = resp.model_dump()
+        elif hasattr(resp, "model_dump_json"):
+            dumped = json.loads(resp.model_dump_json())
+        else:
+            # last resort: try __dict__ then json roundtrip
+            dumped = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
+    except Exception:
+        dumped = None
+
+    if dumped is not None:
+        found = _deep_find_prediction_obj(dumped)
+        if found:
+            return found
+
     return None
 
 def _parse_responses_text(resp) -> str:
@@ -204,10 +269,7 @@ def _parse_responses_text(resp) -> str:
     return "".join(text_parts)
 
 def _extract_json_snippet(s: str) -> str:
-    """
-    As a last resort for Chat Completions without enforced schema,
-    pull the largest {...} block from the reply.
-    """
+    """As a last resort, pull the largest {...} block from a string."""
     if not isinstance(s, str):
         return ""
     start = s.find("{")
@@ -223,6 +285,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls GPT-5 mini with best-available method:
       A) Responses API + text.format (JSON schema w/ name+schema+strict)
+         - if empty/opaque output, *gracefully falls through* to Path B/C
       B) Responses API + response_format (older)
       C) Chat Completions fallback (with/without response_format)
     """
@@ -239,8 +302,8 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     last_err: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
+        # ---------------- Path A: Responses with text.format -------------------
         try:
-            # ---- Path A: Responses with text.format ----
             tokens_kw = _responses_tokens_kw()
             kwargs = {
                 "model": MODEL_NAME,
@@ -262,89 +325,107 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return parsed
 
             text_out = _parse_responses_text(resp)
-            if not text_out.strip():
-                raise RuntimeError("Empty text output from Responses API (text.format).")
-            return json.loads(text_out)
-
-        except TypeError as e_a:
-            # If Path A kw args aren't supported, try Path B
-            last_err = e_a
-            try:
-                tokens_kw = _responses_tokens_kw()
-                kwargs = {
-                    "model": MODEL_NAME,
-                    "input": [msg_system, msg_user],
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": SCHEMA_NAME,
-                            "schema": PREDICTION_JSON_SCHEMA,
-                            "strict": STRICT_OUTPUT,
-                        },
-                    },
-                    tokens_kw: 900,
-                }
-                resp = client.responses.create(**kwargs)
-
-                parsed = _extract_parsed_from_responses(resp)
-                if parsed is not None:
-                    return parsed
-
-                text_out = _parse_responses_text(resp)
-                if not text_out.strip():
-                    raise RuntimeError("Empty text output from Responses API (response_format).")
+            if text_out.strip():
                 return json.loads(text_out)
 
-            except TypeError as e_b:
-                # Path C: Chat Completions fallback
-                last_err = e_b
-                try:
-                    cc = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                        ],
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": SCHEMA_NAME,
-                                "schema": PREDICTION_JSON_SCHEMA,
-                                "strict": STRICT_OUTPUT,
-                            },
-                        },
-                        max_tokens=900,
-                    )
-                    text = cc.choices[0].message.content
-                except TypeError:
-                    # Oldest clients without response_format: coerce JSON via instructions
-                    sys_instr = SYSTEM_INSTRUCTIONS + " IMPORTANT: Reply ONLY with JSON that matches the schema keys."
-                    cc = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=[
-                            {"role": "system", "content": sys_instr},
-                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                        ],
-                        max_tokens=900,
-                    )
-                    text = cc.choices[0].message.content
+            # No text? Fall through to Path B without raising.
+            logger.debug("Responses text.format returned no text; trying response_format shape...")
 
-                json_text = _extract_json_snippet(text)
-                if not json_text:
-                    raise RuntimeError("Empty text output from Chat Completions.")
+        except Exception as e_a:
+            last_err = e_a
+            logger.debug("Path A failed: %s", e_a)
+
+        # ---------------- Path B: Responses with response_format ---------------
+        try:
+            tokens_kw = _responses_tokens_kw()
+            kwargs = {
+                "model": MODEL_NAME,
+                "input": [msg_system, msg_user],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": SCHEMA_NAME,
+                        "schema": PREDICTION_JSON_SCHEMA,
+                        "strict": STRICT_OUTPUT,
+                    },
+                },
+                tokens_kw: 900,
+            }
+            resp = client.responses.create(**kwargs)
+
+            parsed = _extract_parsed_from_responses(resp)
+            if parsed is not None:
+                return parsed
+
+            text_out = _parse_responses_text(resp)
+            if text_out.strip():
+                return json.loads(text_out)
+
+            logger.debug("Responses response_format returned no text; trying Chat Completions...")
+
+        except Exception as e_b:
+            last_err = e_b
+            logger.debug("Path B failed: %s", e_b)
+
+        # ---------------- Path C: Chat Completions fallback --------------------
+        try:
+            # Try with response_format first (newer servers)
+            cc = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": SCHEMA_NAME,
+                        "schema": PREDICTION_JSON_SCHEMA,
+                        "strict": STRICT_OUTPUT,
+                    },
+                },
+                max_tokens=900,
+            )
+            text = cc.choices[0].message.content
+            json_text = _extract_json_snippet(text)
+            if json_text:
                 return json.loads(json_text)
+        except TypeError as e_c1:
+            last_err = e_c1
+            logger.debug("Chat Completions with response_format not supported: %s", e_c1)
+        except Exception as e_c2:
+            last_err = e_c2
+            logger.debug("Chat Completions with response_format failed: %s", e_c2)
 
-        except Exception as e:
-            last_err = e
-            if attempt < MAX_RETRIES:
-                sleep_for = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
-                logger.warning(
-                    "Model call failed (attempt %d/%d): %s. Retrying in %.1fs",
-                    attempt, MAX_RETRIES, e, sleep_for
-                )
-                time.sleep(sleep_for)
-            else:
-                break
+        try:
+            # Oldest path: instruct-only JSON
+            sys_instr = SYSTEM_INSTRUCTIONS + " IMPORTANT: Reply ONLY with JSON that matches the schema keys."
+            cc = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": sys_instr},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                max_tokens=900,
+            )
+            text = cc.choices[0].message.content
+            json_text = _extract_json_snippet(text)
+            if json_text:
+                return json.loads(json_text)
+        except Exception as e_c3:
+            last_err = e_c3
+            logger.debug("Chat Completions fallback failed: %s", e_c3)
+
+        # Retry loop backoff
+        if attempt < MAX_RETRIES:
+            sleep_for = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
+            logger.warning(
+                "Model call failed (attempt %d/%d): %s. Retrying in %.1fs",
+                attempt, MAX_RETRIES, last_err, sleep_for
+            )
+            time.sleep(sleep_for)
+        else:
+            break
 
     raise RuntimeError(f"Failed to get model response after {MAX_RETRIES} attempts: {last_err}")
 
