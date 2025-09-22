@@ -26,7 +26,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-mini")
 MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 RETRY_BACKOFF_SEC = float(os.getenv("OPENAI_RETRY_BACKOFF_SEC", "2.0"))
 
-# Odds guardrails (used by your insertion layer, but we also warn here)
+# Odds guardrails
 MIN_ODDS = float(os.getenv("PREDICTION_MIN_ODDS", "1.6"))
 MAX_ODDS = float(os.getenv("PREDICTION_MAX_ODDS", "2.3"))
 
@@ -36,7 +36,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------------------------------------------------------
-# Structured Output Schema (JSON Schema for model) — ONLY Over/Under 2.5
+# Structured Output Schema — ONLY Over/Under 2.5
 # ------------------------------------------------------------------------------
 SCHEMA_NAME = "OverUnder25Prediction"
 PREDICTION_JSON_SCHEMA = {
@@ -74,9 +74,9 @@ SYSTEM_INSTRUCTIONS = (
     "You are an expert football betting analyst. "
     "Given structured match data (teams, form, injuries, H2H, league, venue, odds), "
     "evaluate ONLY the Over/Under 2.5 goals market. "
-    "Calibrate probabilities, compute edge vs. listed odds, and set po_value true only for positive EV "
-    f"within the provided odds guardrails ({MIN_ODDS}–{MAX_ODDS}). "
-    "Keep bankroll_pct modest (0.25–1.5) unless edge is exceptional. "
+    f"Use odds guardrails of {MIN_ODDS}–{MAX_ODDS}. "
+    "Calibrate probabilities, compute edge vs. listed odds, set po_value true only for positive EV, "
+    "and keep bankroll_pct modest (0.25–1.5) unless edge is exceptional. "
     "Return ONLY JSON conforming to the provided schema."
 )
 
@@ -90,8 +90,10 @@ def _validate_prediction_block(block: Dict[str, Any]) -> Tuple[bool, Optional[st
         return False, f"over_2_5: missing {missing}"
     try:
         if not (MIN_ODDS <= float(block["odds"]) <= MAX_ODDS):
-            logger.warning("⚠️ over_2_5 odds out of range: %.3f (allowed %.2f–%.2f)",
-                           float(block["odds"]), MIN_ODDS, MAX_ODDS)
+            logger.warning(
+                "⚠️ over_2_5 odds out of range: %.3f (allowed %.2f–%.2f)",
+                float(block["odds"]), MIN_ODDS, MAX_ODDS
+            )
     except Exception:
         logger.warning("⚠️ over_2_5 has non-numeric odds: %r", block.get("odds"))
     return True, None
@@ -117,7 +119,7 @@ def _supports_arg(fn, name: str) -> bool:
         return False
 
 def _responses_tokens_kw() -> str:
-    """Return the correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
+    """Correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _iter_all_values(obj: Any) -> Iterable[Any]:
@@ -262,6 +264,17 @@ def _apply_backstop_if_missing(payload: Dict[str, Any], data: Dict[str, Any]) ->
     return data
 
 # ------------------------------------------------------------------------------
+# Chat tokens shim (newer models require max_completion_tokens)
+# ------------------------------------------------------------------------------
+def _chat_tokens_kwargs(n: int = 900) -> dict:
+    try:
+        if "max_completion_tokens" in inspect.signature(client.chat.completions.create).parameters:
+            return {"max_completion_tokens": n}
+    except Exception:
+        pass
+    return {"max_tokens": n}
+
+# ------------------------------------------------------------------------------
 # Model call (with compat shim across SDKs)
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -339,7 +352,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                max_tokens=900,
+                **_chat_tokens_kwargs(900),
             )
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
@@ -361,7 +374,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                     {"role": "system", "content": sys_instr},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
-                max_tokens=900,
+                **_chat_tokens_kwargs(900),
             )
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
@@ -390,8 +403,15 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Returns an object with ONLY the over_2_5 market.
     """
     try:
+        # Force a sane fixture_id for logs and DB
+        fixture_id = match_data.get("fixture_id")
+        try:
+            fixture_id = int(fixture_id)
+        except Exception:
+            fixture_id = 0
+
         payload = {
-            "fixture_id": match_data.get("fixture_id"),
+            "fixture_id": fixture_id,
             "teams": match_data.get("teams"),
             "odds": match_data.get("odds"),
             "form": match_data.get("form"),
@@ -404,11 +424,16 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         result = _call_model(payload)
 
-        # Final backstop: still missing? Fill stub to satisfy schema and proceed.
+        # If the model returned non-dict or missing, apply backstop
         if not isinstance(result, dict):
             logger.warning("⚠️ Model returned non-dict; applying backstop.")
-            result = {"fixture_id": match_data.get("fixture_id", 0), "predictions": {}}
+            result = {"fixture_id": fixture_id, "predictions": {}}
 
+        # Ensure correct fixture_id shape
+        if not isinstance(result.get("fixture_id"), int):
+            result["fixture_id"] = fixture_id
+
+        # Final backstop: still missing? Fill stub and proceed.
         result = _apply_backstop_if_missing(payload, result)
 
         ok, err = _validate_full_response(result)
