@@ -110,7 +110,7 @@ def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     return True, None
 
 # ------------------------------------------------------------------------------
-# Responses API helpers (robust parsing across SDK versions)
+# Introspection helpers (SDK capability switches)
 # ------------------------------------------------------------------------------
 def _supports_arg(fn, name: str) -> bool:
     try:
@@ -119,18 +119,26 @@ def _supports_arg(fn, name: str) -> bool:
         return False
 
 def _responses_tokens_kw() -> str:
-    """Correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _responses_supports_param(name: str) -> bool:
-    """True if client.responses.create supports a given kwarg."""
     try:
         return name in inspect.signature(client.responses.create).parameters
     except Exception:
         return False
 
+def _chat_tokens_kwargs(n: int = 900) -> dict:
+    try:
+        if "max_completion_tokens" in inspect.signature(client.chat.completions.create).parameters:
+            return {"max_completion_tokens": n}
+    except Exception:
+        pass
+    return {"max_tokens": n}
+
+# ------------------------------------------------------------------------------
+# Generic traversal/extraction
+# ------------------------------------------------------------------------------
 def _iter_all_values(obj: Any) -> Iterable[Any]:
-    """Depth-first iterator over nested values of dict/list/SDK objects."""
     if isinstance(obj, dict):
         for v in obj.values():
             yield v
@@ -159,7 +167,6 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
                 pass
 
 def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
-    """Find a dict with fixture_id + predictions.over_2_5."""
     if isinstance(obj, dict):
         if "fixture_id" in obj and isinstance(obj.get("predictions"), dict) and "over_2_5" in obj["predictions"]:
             return obj
@@ -173,7 +180,6 @@ def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
     return None
 
 def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
-    """Pull parsed JSON from Responses API objects; deep-search if needed."""
     parsed = getattr(resp, "output_parsed", None)
     if parsed is not None:
         return parsed
@@ -192,12 +198,9 @@ def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
                             return x
 
     try:
-        if hasattr(resp, "model_dump"):
-            dumped = resp.model_dump()
-        elif hasattr(resp, "model_dump_json"):
-            dumped = json.loads(resp.model_dump_json())
-        else:
-            dumped = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
+        dumped = resp.model_dump() if hasattr(resp, "model_dump") else json.loads(
+            resp.model_dump_json() if hasattr(resp, "model_dump_json") else json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o)))
+        )
     except Exception:
         dumped = None
 
@@ -208,7 +211,6 @@ def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
     return None
 
 def _parse_responses_text(resp) -> str:
-    """Extract text from a Responses response, handling SDK objects."""
     txt = getattr(resp, "output_text", None)
     if isinstance(txt, str) and txt.strip():
         return txt
@@ -232,17 +234,35 @@ def _parse_responses_text(resp) -> str:
     return "".join(parts)
 
 def _extract_json_snippet(s: str) -> str:
-    """As a last resort, pull the largest {...} block from a string."""
     if not isinstance(s, str) or not s:
         return ""
     start = s.find("{"); end = s.rfind("}")
     return s[start:end+1] if (start != -1 and end != -1 and end > start) else s.strip()
 
+def _extract_from_chat(cc) -> Optional[Dict[str, Any]]:
+    try:
+        choices = getattr(cc, "choices", []) or []
+        for ch in choices:
+            msg = getattr(ch, "message", None)
+            if msg is None:
+                continue
+            parsed = getattr(msg, "parsed", None)
+            if isinstance(parsed, dict):
+                return parsed
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip():
+                try:
+                    return json.loads(_extract_json_snippet(content))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
 # ------------------------------------------------------------------------------
 # Backstop (if model returns nothing or partial)
 # ------------------------------------------------------------------------------
 def _default_stub_over25(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Try to use odds from payload; else fall back to MIN_ODDS
     def _num(x):
         try:
             return float(x)
@@ -260,7 +280,7 @@ def _default_stub_over25(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _apply_backstop_if_missing(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
-    data = dict(data)  # shallow copy
+    data = dict(data)
     preds = dict(data.get("predictions") or {})
     if "over_2_5" not in preds:
         logger.warning("⚠️ Backstop fill for missing market: over_2_5")
@@ -269,104 +289,137 @@ def _apply_backstop_if_missing(payload: Dict[str, Any], data: Dict[str, Any]) ->
     return data
 
 # ------------------------------------------------------------------------------
-# Model call (Responses API only; no Chat fallback)
+# Model call (robust: Responses with instructions → Responses messages → Chat)
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls GPT-5 mini using Responses API only.
-      A) text.format (JSON schema) if supported
-      B) response_format (older) if supported
-    If both fail after retries, returns an empty predictions shell to be backstopped.
+    Call GPT-5 mini with escalating fallbacks:
+      A) Responses.create using `instructions=` and single-string `input` + text.format (JSON schema)
+      B) Responses.create using messages-style input + text.format
+      C) Responses.create using legacy `response_format`
+      D) Chat Completions (with/without response_format)
     """
-    msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
-    msg_user = {
-        "role": "user",
-        "content": [
-            {"type": "input_text", "text": "Match data JSON follows."},
-            {"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)},
-        ],
-    }
-
     has_text_format = _responses_supports_param("text")
     has_resp_format = _responses_supports_param("response_format")
+    has_instructions = _responses_supports_param("instructions")
     tokens_kw = _responses_tokens_kw()
+
+    instructions_str = SYSTEM_INSTRUCTIONS
+    user_blob = "Match data JSON follows.\n" + json.dumps(payload, ensure_ascii=False)
+
+    # Build message objects once
+    msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
+    msg_user = {"role": "user", "content": [{"type": "input_text", "text": user_blob}]}
 
     last_err: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # ---- A) Responses + text.format (only if supported) ----------------------------
+        # ---- A) Responses + instructions + single-string input (preferred) -------------
+        if has_text_format and has_instructions:
+            try:
+                resp = client.responses.create(
+                    model=MODEL_NAME,
+                    instructions=instructions_str,
+                    input=[{"role": "user", "content": [{"type": "input_text", "text": user_blob}]}],
+                    text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                    **{tokens_kw: 900},
+                )
+                parsed = _extract_parsed_from_responses(resp)
+                if parsed is not None:
+                    return parsed
+                text_out = _parse_responses_text(resp)
+                if text_out.strip():
+                    return json.loads(text_out)
+                last_err = RuntimeError("Responses (instructions+text.format) returned empty output.")
+            except Exception as e_a:
+                last_err = e_a
+        else:
+            logger.debug("Either 'text' or 'instructions' not supported; skipping A-path.")
+
+        # ---- B) Responses + messages-style (system/user) + text.format -----------------
         if has_text_format:
             try:
                 resp = client.responses.create(
                     model=MODEL_NAME,
                     input=[msg_system, msg_user],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": SCHEMA_NAME,
-                            "schema": PREDICTION_JSON_SCHEMA,
-                            "strict": STRICT_OUTPUT,
-                        }
-                    },
+                    text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
                     **{tokens_kw: 900},
                 )
                 parsed = _extract_parsed_from_responses(resp)
                 if parsed is not None:
                     return parsed
-
                 text_out = _parse_responses_text(resp)
                 if text_out.strip():
-                    try:
-                        return json.loads(text_out)
-                    except Exception as je:
-                        last_err = ValueError(f"Responses text.format returned non-JSON text: {je}")
-                else:
-                    last_err = RuntimeError("Responses text.format returned empty output.")
-            except Exception as e_a:
-                last_err = e_a
+                    return json.loads(text_out)
+                last_err = RuntimeError("Responses (messages+text.format) returned empty output.")
+            except Exception as e_b:
+                last_err = e_b
         else:
-            logger.debug("Responses 'text' kw not supported; skipping text.format path.")
+            logger.debug("'text' kw not supported; skipping B-path.")
 
-        # ---- B) Responses + response_format (only if supported) ------------------------
+        # ---- C) Responses + legacy response_format -------------------------------------
         if has_resp_format:
             try:
                 resp = client.responses.create(
                     model=MODEL_NAME,
                     input=[msg_system, msg_user],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": SCHEMA_NAME,
-                            "schema": PREDICTION_JSON_SCHEMA,
-                            "strict": STRICT_OUTPUT,
-                        },
-                    },
+                    response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
                     **{tokens_kw: 900},
                 )
                 parsed = _extract_parsed_from_responses(resp)
                 if parsed is not None:
                     return parsed
-
                 text_out = _parse_responses_text(resp)
                 if text_out.strip():
-                    try:
-                        return json.loads(text_out)
-                    except Exception as je:
-                        last_err = ValueError(f"Responses response_format returned non-JSON text: {je}")
-                else:
-                    last_err = RuntimeError("Responses response_format returned empty output.")
-            except Exception as e_b:
-                last_err = e_b
+                    return json.loads(text_out)
+                last_err = RuntimeError("Responses (response_format) returned empty output.")
+            except Exception as e_c:
+                last_err = e_c
         else:
-            logger.debug("Responses 'response_format' kw not supported; skipping response_format path.")
+            logger.debug("'response_format' not supported; skipping C-path.")
+
+        # ---- D1) Chat Completions with response_format ---------------------------------
+        try:
+            cc = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                    {"role": "user", "content": user_blob},
+                ],
+                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                **_chat_tokens_kwargs(900),
+            )
+            parsed = _extract_from_chat(cc)
+            if parsed is not None:
+                return parsed
+            last_err = RuntimeError("Chat with response_format returned empty output (no parsed/content).")
+        except TypeError as e_d1:
+            last_err = e_d1
+        except Exception as e_d1b:
+            last_err = e_d1b
+
+        # ---- D2) Chat Completions (instruction-only JSON) ------------------------------
+        try:
+            sys_instr = SYSTEM_INSTRUCTIONS + " IMPORTANT: Reply ONLY with JSON that matches the schema keys."
+            cc = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": sys_instr},
+                    {"role": "user", "content": user_blob},
+                ],
+                **_chat_tokens_kwargs(900),
+            )
+            parsed = _extract_from_chat(cc)
+            if parsed is not None:
+                return parsed
+            last_err = RuntimeError("Chat fallback returned empty output (no parsed/content).")
+        except Exception as e_d2:
+            last_err = e_d2
 
         # Retry w/ backoff
         if attempt < MAX_RETRIES:
             sleep_for = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
-            logger.warning(
-                "Model call failed (attempt %d/%d): %s. Retrying in %.1fs",
-                attempt, MAX_RETRIES, last_err, sleep_for
-            )
+            logger.warning("Model call failed (attempt %d/%d): %s. Retrying in %.1fs", attempt, MAX_RETRIES, last_err, sleep_for)
             time.sleep(sleep_for)
         else:
             break
