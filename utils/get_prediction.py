@@ -104,7 +104,7 @@ SYSTEM_INSTRUCTIONS = (
     "evaluate three markets (1X2, BTTS, Over/Under 2.5). "
     "Calibrate probabilities, compute edge vs. listed odds, and set po_value true only for positive EV "
     "within the provided odds range. Keep bankroll_pct modest (0.25–1.5) unless edge is exceptional. "
-    "Return ONLY JSON conforming to the provided schema."
+    "Return ONLY JSON conforming to the provided schema. Never omit any market."
 )
 
 # ------------------------------------------------------------------------------
@@ -145,11 +145,9 @@ def _supports_arg(fn, name: str) -> bool:
         return False
 
 def _responses_tokens_kw() -> str:
-    """Return the correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _iter_all_values(obj: Any) -> Iterable[Any]:
-    """Depth-first iterator over nested values of dict/list/SDK objects."""
     if isinstance(obj, dict):
         for v in obj.values():
             yield v
@@ -159,7 +157,6 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
             yield v
             yield from _iter_all_values(v)
     else:
-        # SDK objects: try model_dump()/dict()
         for attr in ("model_dump", "dict"):
             try:
                 if hasattr(obj, attr):
@@ -169,7 +166,6 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
                     return
             except Exception:
                 pass
-        # Also probe common attributes
         for name in ("content", "output", "parsed", "text"):
             try:
                 v = getattr(obj, name, None)
@@ -180,10 +176,6 @@ def _iter_all_values(obj: Any) -> Iterable[Any]:
                 pass
 
 def _deep_find_prediction_obj(obj: Any, require_full: bool = True) -> Optional[Dict[str, Any]]:
-    """
-    Find the first dict that matches the expected shape.
-    If require_full=True, require all three markets to be present.
-    """
     def is_full_schema(d: Dict[str, Any]) -> bool:
         if not (isinstance(d, dict) and "fixture_id" in d and "predictions" in d and isinstance(d["predictions"], dict)):
             return False
@@ -206,10 +198,6 @@ def _deep_find_prediction_obj(obj: Any, require_full: bool = True) -> Optional[D
     return None
 
 def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
-    """
-    Pull parsed JSON directly from Responses API objects if present,
-    falling back to a deep search through a dumped structure.
-    """
     parsed = getattr(resp, "output_parsed", None)
     if parsed is not None:
         return parsed
@@ -244,10 +232,6 @@ def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
     return None
 
 def _parse_responses_text(resp) -> str:
-    """
-    Extract text from a Responses response, handling SDK objects.
-    Aggregates only textual outputs; ignores reasoning traces.
-    """
     txt = getattr(resp, "output_text", None)
     if isinstance(txt, str) and txt.strip():
         return txt
@@ -271,25 +255,87 @@ def _parse_responses_text(resp) -> str:
     return "".join(text_parts)
 
 def _extract_json_snippet(s: str) -> str:
-    """As a last resort, pull the largest {...} block from a string."""
     if not isinstance(s, str) or not s:
         return ""
     start = s.find("{"); end = s.rfind("}")
     return s[start:end+1] if (start != -1 and end != -1 and end > start) else s.strip()
 
 # ------------------------------------------------------------------------------
-# Partial repair helpers (if model returns a partial object)
+# Partial repair + backstop
 # ------------------------------------------------------------------------------
 def _missing_markets(data: Dict[str, Any]) -> set:
     want = {"one_x_two", "btts", "over_2_5"}
     have = set(data.get("predictions", {}).keys()) if isinstance(data.get("predictions"), dict) else set()
     return want - have
 
+def _default_stub_for_market(market: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Best-effort odds from payload; fall back to MIN_ODDS
+    def _num(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    if market == "one_x_two":
+        # Prefer Draw odds if present; else any available; else MIN_ODDS
+        d = payload.get("odds", {}).get("one_x_two", {}) if isinstance(payload.get("odds", {}).get("one_x_two", {}), dict) else {}
+        odds = _num(d.get("Draw")) or _num(d.get("Home")) or _num(d.get("Away")) or MIN_ODDS
+        return {
+            "prediction": "Draw",
+            "confidence": 0,
+            "edge": 0,
+            "po_value": False,
+            "odds": odds,
+            "bankroll_pct": 0,
+            "rationale": "Stub filled due to missing market; no value."
+        }
+    if market == "btts":
+        d = payload.get("odds", {}).get("btts", {}) if isinstance(payload.get("odds", {}).get("btts", {}), dict) else {}
+        odds = _num(d.get("No")) or _num(d.get("Yes")) or MIN_ODDS
+        return {
+            "prediction": "No",
+            "confidence": 0,
+            "edge": 0,
+            "po_value": False,
+            "odds": odds,
+            "bankroll_pct": 0,
+            "rationale": "Stub filled due to missing market; no value."
+        }
+    if market == "over_2_5":
+        # Many feeds only include Over price; use it if present; else MIN_ODDS
+        odds = _num(payload.get("odds", {}).get("over_2_5")) or MIN_ODDS
+        return {
+            "prediction": "Under",
+            "confidence": 0,
+            "edge": 0,
+            "po_value": False,
+            "odds": odds,
+            "bankroll_pct": 0,
+            "rationale": "Stub filled due to missing market; no value."
+        }
+    # Fallback (shouldn't hit)
+    return {
+        "prediction": "Under",
+        "confidence": 0,
+        "edge": 0,
+        "po_value": False,
+        "odds": MIN_ODDS,
+        "bankroll_pct": 0,
+        "rationale": "Stub."
+    }
+
+def _apply_backstop_fill(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(data)  # shallow copy
+    preds = dict(data.get("predictions") or {})
+    missing = _missing_markets({"predictions": preds})
+    if missing:
+        logger.warning("⚠️ Backstop fill for missing markets: %s", ", ".join(sorted(missing)))
+    for m in missing:
+        preds[m] = _default_stub_for_market(m, payload)
+    data["predictions"] = preds
+    return data
+
 def _repair_missing_markets(payload: Dict[str, Any], partial: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Ask the model to fill only the missing markets and return the full object.
-    If uncertain, the model should set po_value=false and bankroll_pct=0.
-    """
     missing = _missing_markets(partial)
     if not missing:
         return partial
@@ -369,8 +415,8 @@ def _repair_missing_markets(payload: Dict[str, Any], partial: Dict[str, Any]) ->
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls GPT-5 mini with best-available method:
-      A) Responses API + text.format (JSON schema w/ name+schema+strict)
-         (if opaque output, gracefully fall through to B/C)
+      A) Responses API + text.format (JSON schema)
+         (if opaque output, fall through to B/C)
       B) Responses API + response_format (older)
       C) Chat Completions fallback (with/without response_format)
     """
@@ -500,13 +546,18 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         result = _call_model(payload)
 
-        # If the model returned a partial object, attempt a one-shot repair
+        # If the model returned a partial object, try one-shot repair
         missing = _missing_markets(result)
         if missing:
             logger.warning("⚠️ Partial prediction detected; missing markets: %s. Attempting repair...", ", ".join(sorted(missing)))
             repaired = _repair_missing_markets(payload, result)
             if repaired:
                 result = repaired
+
+        # Final backstop: still missing? Fill stubs to satisfy schema and proceed.
+        missing = _missing_markets(result)
+        if missing:
+            result = _apply_backstop_fill(payload, result)
 
         ok, err = _validate_full_response(result)
         if not ok:
