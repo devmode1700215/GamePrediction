@@ -33,7 +33,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------------------------------------------------------
-# Structured Output Schema (for JSON Schema mode)
+# Structured Output Schema
 # ------------------------------------------------------------------------------
 SCHEMA_NAME = "MatchPredictions"
 PREDICTION_JSON_SCHEMA = {
@@ -147,11 +147,9 @@ def _responses_tokens_kw() -> str:
 
 def _parse_responses_text(resp) -> str:
     """Extract output_text from a Responses API response."""
-    # Prefer aggregate convenience field if present
     text = getattr(resp, "output_text", None)
     if text:
         return text
-    # Otherwise, stitch from output/content
     text_out = ""
     for item in getattr(resp, "output", []):
         for c in item.get("content", []):
@@ -168,6 +166,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
       A) Responses API + text.format (JSON schema w/ name+schema+strict)
       B) Responses API + response_format (older)
       C) Chat Completions fallback
+    NOTE: temperature/top_p omitted because many GPT-5/Reasoning models reject them.
     """
     # Use input_text for all content parts
     msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
@@ -196,7 +195,6 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "strict": STRICT_OUTPUT,
                     }
                 },
-                "temperature": 0.2,
                 tokens_kw: 900,
             }
             resp = client.responses.create(**kwargs)
@@ -224,7 +222,6 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                             "strict": STRICT_OUTPUT,
                         },
                     },
-                    "temperature": 0.2,
                     tokens_kw: 900,
                 }
                 resp = client.responses.create(**kwargs)
@@ -253,7 +250,6 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                             "strict": STRICT_OUTPUT,
                         },
                     },
-                    temperature=0.2,
                     max_tokens=900,
                 )
                 text = cc.choices[0].message.content
