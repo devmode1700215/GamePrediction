@@ -146,16 +146,52 @@ def _responses_tokens_kw() -> str:
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _parse_responses_text(resp) -> str:
-    """Extract output_text from a Responses API response."""
-    text = getattr(resp, "output_text", None)
-    if text:
-        return text
-    text_out = ""
-    for item in getattr(resp, "output", []):
-        for c in item.get("content", []):
-            if c.get("type") == "output_text":
-                text_out += c.get("text", "")
-    return text_out
+    """
+    Robustly extract plain text from a Responses API response, handling both
+    dict-shaped payloads and SDK object instances (e.g., ResponseReasoningItem).
+    We ignore non-text items (reasoning traces, etc.).
+    """
+    # 1) Prefer direct aggregate, if exposed by the SDK
+    txt = getattr(resp, "output_text", None)
+    if isinstance(txt, str) and txt.strip():
+        return txt
+
+    # 2) Walk the structured output list
+    text_parts = []
+    output_list = getattr(resp, "output", None)
+
+    if output_list is None:
+        # Some SDKs expose a top-level 'message' with content; last resort:
+        # try to stringify any available 'content' field.
+        msg = getattr(resp, "message", None)
+        content = getattr(msg, "content", None) if msg is not None else None
+        if isinstance(content, str):
+            return content
+        return ""
+
+    for item in output_list:
+        # item can be a dict or an SDK object
+        if isinstance(item, dict):
+            content = item.get("content", []) or []
+        else:
+            content = getattr(item, "content", []) or []
+
+        # content is a list of chunks; each chunk can be dict or object
+        for chunk in content:
+            # detect the chunk type
+            if isinstance(chunk, dict):
+                ctype = chunk.get("type")
+                ctext = chunk.get("text", "")
+            else:
+                ctype = getattr(chunk, "type", None)
+                ctext = getattr(chunk, "text", "")
+
+            # We only aggregate textual outputs
+            if ctype in ("output_text", "summary_text") and isinstance(ctext, str):
+                text_parts.append(ctext)
+
+    return "".join(text_parts)
+
 
 # ------------------------------------------------------------------------------
 # Model call (with compat shim across SDKs)
