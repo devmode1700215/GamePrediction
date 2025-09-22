@@ -4,6 +4,7 @@ import os
 import json
 import time
 import logging
+import inspect
 from typing import Any, Dict, Tuple, Optional
 
 from dotenv import load_dotenv
@@ -106,7 +107,6 @@ def _validate_prediction_block(name: str, block: Dict[str, Any]) -> Tuple[bool, 
     missing = [k for k in required if k not in block]
     if missing:
         return False, f"{name}: missing {missing}"
-    # Warn if odds outside guardrails; insertion layer can skip later
     try:
         if not (MIN_ODDS <= float(block["odds"]) <= MAX_ODDS):
             logger.warning("⚠️ %s odds out of range: %.3f (allowed %.2f–%.2f)",
@@ -127,11 +127,27 @@ def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             return False, err
     return True, None
 
+# ---- Compatibility helpers ---------------------------------------------------
+def _supports_arg(fn, name: str) -> bool:
+    try:
+        return name in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+def _responses_tokens_arg() -> str:
+    """Return the correct tokens kw: 'max_output_tokens' (Responses) or 'max_tokens' (older)."""
+    fn = client.responses.create
+    if _supports_arg(fn, "max_output_tokens"):
+        return "max_output_tokens"
+    return "max_tokens"
+
 # ---- Model call --------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls GPT-5 mini via Responses API using text.format with a JSON schema.
-    Returns a parsed dict.
+    Calls GPT-5 mini with best-available method:
+    1) Responses API with text.format (JSON schema)
+    2) Responses API with response_format (older)
+    3) Chat Completions fallback (oldest)
     """
     user_content = [
         {"type": "text", "text": "Match data JSON follows."},
@@ -141,26 +157,24 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = client.responses.create(
-                model=MODEL_NAME,
-                input=[
+            # -------- Path A: Responses with text.format -----------
+            tokens_kw = _responses_tokens_arg()
+            kwargs = {
+                "model": MODEL_NAME,
+                "input": [
                     {"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCTIONS}]},
                     {"role": "user", "content": user_content},
                 ],
-                # NOTE: new SDK signature — use text.format instead of response_format
-                text={"format": {"type": "json_schema", "json_schema": PREDICTION_SCHEMA}},
-                temperature=0.2,
-                max_output_tokens=900,
-                verbosity="low",
-                reasoning={"effort": "medium"},
-            )
+                "text": {"format": {"type": "json_schema", "json_schema": PREDICTION_SCHEMA}},
+                "temperature": 0.2,
+                tokens_kw: 900,
+            }
+            resp = client.responses.create(**kwargs)
 
-            # Prefer parsed if SDK exposes it
             parsed = getattr(resp, "output_parsed", None)
             if parsed is not None:
                 return parsed
 
-            # Otherwise, reconstruct text and json.loads
             text_out = ""
             for item in getattr(resp, "output", []):
                 for c in item.get("content", []):
@@ -169,6 +183,53 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             if not text_out:
                 text_out = getattr(resp, "output_text", "") or ""
             return json.loads(text_out)
+
+        except TypeError as e:
+            # Try Path B if text.format isn't supported
+            last_err = e
+            try:
+                tokens_kw = _responses_tokens_arg()
+                kwargs = {
+                    "model": MODEL_NAME,
+                    "input": [
+                        {"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCTIONS}]},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "response_format": {"type": "json_schema", "json_schema": PREDICTION_SCHEMA},
+                    "temperature": 0.2,
+                    tokens_kw: 900,
+                }
+                resp = client.responses.create(**kwargs)
+
+                parsed = getattr(resp, "output_parsed", None)
+                if parsed is not None:
+                    return parsed
+
+                text_out = ""
+                for item in getattr(resp, "output", []):
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            text_out += c.get("text", "")
+                if not text_out:
+                    text_out = getattr(resp, "output_text", "") or ""
+                return json.loads(text_out)
+
+            except TypeError as e2:
+                # -------- Path C: Chat Completions fallback ----------
+                last_err = e2
+                cc = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                    # many older SDKs accept response_format here too; if not, the model still tries to return JSON
+                    response_format={"type": "json_schema", "json_schema": PREDICTION_SCHEMA},
+                    temperature=0.2,
+                    max_tokens=900,
+                )
+                text = cc.choices[0].message.content
+                return json.loads(text)
 
         except Exception as e:
             last_err = e
@@ -184,10 +245,6 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---- Public API --------------------------------------------------------------
 def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Entry used by main.py
-    Returns structured dict matching PREDICTION_SCHEMA or None if invalid.
-    """
     try:
         payload = {
             "fixture_id": match_data.get("fixture_id"),
