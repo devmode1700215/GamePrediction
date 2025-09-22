@@ -282,7 +282,7 @@ def _chat_tokens_kwargs(n: int = 900) -> dict:
     return {"max_tokens": n}
 
 # ------------------------------------------------------------------------------
-# Model call (with capability checks per SDK)
+# Model call (with capability checks per SDK) — with explicit errors per path
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -300,10 +300,11 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
         ],
     }
 
-    last_err: Optional[Exception] = None
     has_text_format = _responses_supports_param("text")
     has_resp_format = _responses_supports_param("response_format")
     tokens_kw = _responses_tokens_kw()
+
+    last_err: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         # ---- A) Responses + text.format (only if supported) ----------------------------
@@ -321,12 +322,14 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
 
                 text_out = _parse_responses_text(resp)
                 if text_out.strip():
-                    return json.loads(text_out)
-
-                logger.debug("Responses text.format returned no text; will try other paths...")
+                    try:
+                        return json.loads(text_out)
+                    except Exception as je:
+                        last_err = ValueError(f"Responses text.format returned non-JSON text: {je}")
+                else:
+                    last_err = RuntimeError("Responses text.format returned empty output.")
             except Exception as e_a:
                 last_err = e_a
-                logger.debug("Responses text.format path failed: %s", e_a)
         else:
             logger.debug("Responses 'text' kw not supported; skipping text.format path.")
 
@@ -345,12 +348,14 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
 
                 text_out = _parse_responses_text(resp)
                 if text_out.strip():
-                    return json.loads(text_out)
-
-                logger.debug("Responses response_format returned no text; will try Chat Completions...")
+                    try:
+                        return json.loads(text_out)
+                    except Exception as je:
+                        last_err = ValueError(f"Responses response_format returned non-JSON text: {je}")
+                else:
+                    last_err = RuntimeError("Responses response_format returned empty output.")
             except Exception as e_b:
                 last_err = e_b
-                logger.debug("Responses response_format path failed: %s", e_b)
         else:
             logger.debug("Responses 'response_format' kw not supported; skipping response_format path.")
 
@@ -368,13 +373,16 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
             if json_text:
-                return json.loads(json_text)
+                try:
+                    return json.loads(json_text)
+                except Exception as je:
+                    last_err = ValueError(f"Chat with response_format returned non-JSON text: {je}")
+            else:
+                last_err = RuntimeError("Chat with response_format returned empty output.")
         except TypeError as e_c1:
             last_err = e_c1
-            logger.debug("Chat Completions with response_format not supported: %s", e_c1)
         except Exception as e_c2:
             last_err = e_c2
-            logger.debug("Chat Completions with response_format failed: %s", e_c2)
 
         # ---- C2) Oldest Chat Completions path (instruction-only JSON) ------------------
         try:
@@ -390,10 +398,14 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             text = cc.choices[0].message.content
             json_text = _extract_json_snippet(text)
             if json_text:
-                return json.loads(json_text)
+                try:
+                    return json.loads(json_text)
+                except Exception as je:
+                    last_err = ValueError(f"Chat fallback returned non-JSON text: {je}")
+            else:
+                last_err = RuntimeError("Chat fallback returned empty output.")
         except Exception as e_c3:
             last_err = e_c3
-            logger.debug("Chat Completions fallback failed: %s", e_c3)
 
         # Retry w/ backoff
         if attempt < MAX_RETRIES:
