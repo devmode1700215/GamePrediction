@@ -133,7 +133,7 @@ def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     return True, None
 
 # ------------------------------------------------------------------------------
-# Responses API compatibility helpers
+# Responses API parsing helpers
 # ------------------------------------------------------------------------------
 def _supports_arg(fn, name: str) -> bool:
     try:
@@ -145,24 +145,44 @@ def _responses_tokens_kw() -> str:
     """Return the correct tokens kw: 'max_output_tokens' (new) or 'max_tokens' (older)."""
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
+def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
+    """
+    Pull parsed JSON directly from Responses API objects if present,
+    even when not exposed via `output_parsed`.
+    """
+    parsed = getattr(resp, "output_parsed", None)
+    if parsed is not None:
+        return parsed
+
+    output_list = getattr(resp, "output", None)
+    if not output_list:
+        return None
+
+    for item in output_list:
+        content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
+        for chunk in content:
+            # chunk may be dict or SDK object
+            if isinstance(chunk, dict):
+                if "parsed" in chunk and isinstance(chunk["parsed"], (dict, list)):
+                    return chunk["parsed"]
+            else:
+                maybe = getattr(chunk, "parsed", None)
+                if isinstance(maybe, (dict, list)):
+                    return maybe
+    return None
+
 def _parse_responses_text(resp) -> str:
     """
-    Robustly extract plain text from a Responses API response, handling both
-    dict-shaped payloads and SDK object instances (e.g., ResponseReasoningItem).
-    We ignore non-text items (reasoning traces, etc.).
+    Robustly extract text from a Responses response, handling SDK objects.
+    Only aggregates textual outputs; ignores reasoning traces.
     """
-    # 1) Prefer direct aggregate, if exposed by the SDK
     txt = getattr(resp, "output_text", None)
     if isinstance(txt, str) and txt.strip():
         return txt
 
-    # 2) Walk the structured output list
     text_parts = []
     output_list = getattr(resp, "output", None)
-
     if output_list is None:
-        # Some SDKs expose a top-level 'message' with content; last resort:
-        # try to stringify any available 'content' field.
         msg = getattr(resp, "message", None)
         content = getattr(msg, "content", None) if msg is not None else None
         if isinstance(content, str):
@@ -170,28 +190,31 @@ def _parse_responses_text(resp) -> str:
         return ""
 
     for item in output_list:
-        # item can be a dict or an SDK object
-        if isinstance(item, dict):
-            content = item.get("content", []) or []
-        else:
-            content = getattr(item, "content", []) or []
-
-        # content is a list of chunks; each chunk can be dict or object
+        content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
         for chunk in content:
-            # detect the chunk type
             if isinstance(chunk, dict):
                 ctype = chunk.get("type")
                 ctext = chunk.get("text", "")
             else:
                 ctype = getattr(chunk, "type", None)
                 ctext = getattr(chunk, "text", "")
-
-            # We only aggregate textual outputs
             if ctype in ("output_text", "summary_text") and isinstance(ctext, str):
                 text_parts.append(ctext)
 
     return "".join(text_parts)
 
+def _extract_json_snippet(s: str) -> str:
+    """
+    As a last resort for Chat Completions without enforced schema,
+    pull the largest {...} block from the reply.
+    """
+    if not isinstance(s, str):
+        return ""
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return s[start : end + 1]
+    return s.strip()
 
 # ------------------------------------------------------------------------------
 # Model call (with compat shim across SDKs)
@@ -201,8 +224,7 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
     Calls GPT-5 mini with best-available method:
       A) Responses API + text.format (JSON schema w/ name+schema+strict)
       B) Responses API + response_format (older)
-      C) Chat Completions fallback
-    NOTE: temperature/top_p omitted because many GPT-5/Reasoning models reject them.
+      C) Chat Completions fallback (with/without response_format)
     """
     # Use input_text for all content parts
     msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
@@ -235,11 +257,13 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
             }
             resp = client.responses.create(**kwargs)
 
-            parsed = getattr(resp, "output_parsed", None)
+            parsed = _extract_parsed_from_responses(resp)
             if parsed is not None:
                 return parsed
 
             text_out = _parse_responses_text(resp)
+            if not text_out.strip():
+                raise RuntimeError("Empty text output from Responses API (text.format).")
             return json.loads(text_out)
 
         except TypeError as e_a:
@@ -262,34 +286,53 @@ def _call_model(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 resp = client.responses.create(**kwargs)
 
-                parsed = getattr(resp, "output_parsed", None)
+                parsed = _extract_parsed_from_responses(resp)
                 if parsed is not None:
                     return parsed
 
                 text_out = _parse_responses_text(resp)
+                if not text_out.strip():
+                    raise RuntimeError("Empty text output from Responses API (response_format).")
                 return json.loads(text_out)
 
             except TypeError as e_b:
                 # Path C: Chat Completions fallback
                 last_err = e_b
-                cc = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": SCHEMA_NAME,
-                            "schema": PREDICTION_JSON_SCHEMA,
-                            "strict": STRICT_OUTPUT,
+                try:
+                    cc = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        ],
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": SCHEMA_NAME,
+                                "schema": PREDICTION_JSON_SCHEMA,
+                                "strict": STRICT_OUTPUT,
+                            },
                         },
-                    },
-                    max_tokens=900,
-                )
-                text = cc.choices[0].message.content
-                return json.loads(text)
+                        max_tokens=900,
+                    )
+                    text = cc.choices[0].message.content
+                except TypeError:
+                    # Oldest clients without response_format: coerce JSON via instructions
+                    sys_instr = SYSTEM_INSTRUCTIONS + " IMPORTANT: Reply ONLY with JSON that matches the schema keys."
+                    cc = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=[
+                            {"role": "system", "content": sys_instr},
+                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        ],
+                        max_tokens=900,
+                    )
+                    text = cc.choices[0].message.content
+
+                json_text = _extract_json_snippet(text)
+                if not json_text:
+                    raise RuntimeError("Empty text output from Chat Completions.")
+                return json.loads(json_text)
 
         except Exception as e:
             last_err = e
