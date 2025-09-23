@@ -10,17 +10,30 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+# ──────────────────────────────────────────────────────────────────────────────
+# ENV (accept your names: SUPABASE_URL + SUPABASE_KEY)
+# ──────────────────────────────────────────────────────────────────────────────
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+
+# Prefer service role if present; otherwise accept your SUPABASE_KEY,
+# or anon (only works if your RLS allows inserts).
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("SUPABASE_KEY")
+    or os.getenv("SUPABASE_ANON_KEY")
+)
+
 TABLE = os.getenv("VALUE_PREDICTIONS_TABLE", "value_predictions")
 
 # Behavior flags
-ALWAYS_WRITE = os.getenv("OU25_ALWAYS_WRITE", "0") == "1"  # write even when non-value
-ONLY_WRITE_VALUE = os.getenv("OU25_ONLY_WRITE_VALUE", "0") == "1"  # force gate by value
+ALWAYS_WRITE = os.getenv("OU25_ALWAYS_WRITE", "0") == "1"      # write even when non-value
+ONLY_WRITE_VALUE = os.getenv("OU25_ONLY_WRITE_VALUE", "0") == "1"  # gate by value
 
 def _headers() -> Dict[str, str]:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY/ANON_KEY")
+    if not SUPABASE_URL:
+        raise RuntimeError("Missing SUPABASE_URL (e.g. https://<project>.supabase.co)")
+    if not SUPABASE_KEY:
+        raise RuntimeError("Missing Supabase key (set SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY or SUPABASE_ANON_KEY)")
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -29,9 +42,7 @@ def _headers() -> Dict[str, str]:
     }
 
 def _explain_postgrest_error(text: str) -> str:
-    """
-    Extract a friendly reason from PostgREST error JSON/text.
-    """
+    """Turn PostgREST error JSON into a friendly reason string."""
     try:
         data = json.loads(text)
     except Exception:
@@ -79,7 +90,7 @@ def _post_row(row: Dict[str, Any]) -> Tuple[int, str, int, str]:
 
 def build_row_from_prediction(fixture_id: int, market: str, block: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Map model/local fields to DB row. Adjust here if your DB uses different names.
+    Map model/local fields to DB columns.
     """
     return {
         "fixture_id": int(fixture_id or 0),
@@ -88,16 +99,16 @@ def build_row_from_prediction(fixture_id: int, market: str, block: Dict[str, Any
         "edge": float(block.get("edge") or 0),
         "po_value": bool(block.get("po_value") or False),
         "odds": float(block.get("odds") or 0),
-        "stake_pct": float(block.get("bankroll_pct") or 0),        # map bankroll_pct -> stake_pct
-        "confidence_pct": int(block.get("confidence") or 0),       # map confidence -> confidence_pct
+        "stake_pct": float(block.get("bankroll_pct") or 0),        # bankroll_pct -> stake_pct
+        "confidence_pct": int(block.get("confidence") or 0),       # confidence -> confidence_pct
         "rationale": str(block.get("rationale") or ""),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 def write_value_prediction(fixture_id: int, market: str, block: Optional[Dict[str, Any]]) -> Tuple[int, str]:
     """
-    High-level writer with explicit reasons for '0' writes.
-    Returns (written_count, reason).
+    Write one market row. Returns (written_count, reason).
+    Reasons when 0: MISSING_MARKET, NO_ODDS, NON_VALUE, HTTP_4XX, RLS_FORBIDDEN, etc.
     """
     if not isinstance(block, dict):
         logger.warning("✋ MISSING_MARKET block for fixture %s", fixture_id)
@@ -115,7 +126,6 @@ def write_value_prediction(fixture_id: int, market: str, block: Optional[Dict[st
 
     po_value = bool(block.get("po_value"))
     if ONLY_WRITE_VALUE and not po_value and not ALWAYS_WRITE:
-        # User explicitly wants to write only value bets
         logger.info("ℹ️ NON_VALUE gated write for fixture %s (po_value=false)", fixture_id)
         return 0, "NON_VALUE"
 
