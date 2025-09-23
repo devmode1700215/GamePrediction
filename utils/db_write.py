@@ -11,12 +11,12 @@ import requests
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ENV (accept your names: SUPABASE_URL + SUPABASE_KEY)
+# ENV (your keys from Render: SUPABASE_URL + SUPABASE_KEY)
 # ──────────────────────────────────────────────────────────────────────────────
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 
-# Prefer service role if present; otherwise accept your SUPABASE_KEY,
-# or anon (only works if your RLS allows inserts).
+# Prefer service role if present; otherwise accept SUPABASE_KEY (your current name),
+# or anon (only works if RLS policies allow inserts/deletes).
 SUPABASE_KEY = (
     os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     or os.getenv("SUPABASE_KEY")
@@ -26,8 +26,8 @@ SUPABASE_KEY = (
 TABLE = os.getenv("VALUE_PREDICTIONS_TABLE", "value_predictions")
 
 # Behavior flags
-ALWAYS_WRITE = os.getenv("OU25_ALWAYS_WRITE", "0") == "1"      # write even when non-value
-ONLY_WRITE_VALUE = os.getenv("OU25_ONLY_WRITE_VALUE", "0") == "1"  # gate by value
+ALWAYS_WRITE = os.getenv("OU25_ALWAYS_WRITE", "0") == "1"             # write even when non-value
+ONLY_WRITE_VALUE = os.getenv("OU25_ONLY_WRITE_VALUE", "0") == "1"     # gate by value
 
 def _headers() -> Dict[str, str]:
     if not SUPABASE_URL:
@@ -51,6 +51,8 @@ def _explain_postgrest_error(text: str) -> str:
     details = (data.get("details") or "").lower()
     hint = (data.get("hint") or "").lower()
 
+    if "no unique or exclusion constraint" in msg:
+        return "NO_UNIQUE_FOR_ON_CONFLICT"
     if "upsert" in msg and "unique" in msg:
         return "UPSERT_NEEDS_UNIQUE_CONSTRAINT"
     if "policy" in msg or "rls" in msg or "not authorized" in msg or "permission" in msg:
@@ -69,29 +71,69 @@ def _explain_postgrest_error(text: str) -> str:
         return "UPSERT_NEEDS_UNIQUE_CONSTRAINT"
     return "HTTP_4XX"
 
+def _manual_upsert(row: Dict[str, Any]) -> Tuple[int, str, int, str]:
+    """
+    Fallback when ON CONFLICT can't be used (42P10).
+    DELETE existing (fixture_id, market), then INSERT without on_conflict.
+    Requires permission to DELETE/INSERT (service role recommended).
+    """
+    headers = _headers()
+
+    # 1) DELETE existing rows for this (fixture_id, market)
+    del_url = (
+        f"{SUPABASE_URL}/rest/v1/{TABLE}"
+        f"?fixture_id=eq.{row['fixture_id']}&market=eq.{row['market']}"
+    )
+    del_headers = dict(headers)
+    del_headers["Prefer"] = "return=minimal"
+    del_resp = requests.delete(del_url, headers=del_headers)
+
+    # If RLS forbids delete, report clearly
+    if del_resp.status_code >= 400:
+        reason = _explain_postgrest_error(del_resp.text)
+        return 0, f"DELETE_FAILED_{reason}", del_resp.status_code, del_resp.text
+
+    # 2) INSERT fresh row (no on_conflict)
+    ins_url = f"{SUPABASE_URL}/rest/v1/{TABLE}"
+    ins_resp = requests.post(ins_url, headers=headers, data=json.dumps(row))
+    if ins_resp.status_code >= 400:
+        reason = _explain_postgrest_error(ins_resp.text)
+        return 0, reason, ins_resp.status_code, ins_resp.text
+
+    try:
+        payload = ins_resp.json()
+        written = len(payload) if isinstance(payload, list) else (1 if payload else 0)
+    except Exception:
+        written = 1  # 201 with no body still means success
+    return written, "MANUAL_UPSERT_OK", ins_resp.status_code, ins_resp.text
+
 def _post_row(row: Dict[str, Any]) -> Tuple[int, str, int, str]:
     """
+    Try native upsert first (on_conflict=fixture_id,market).
+    On 42P10 (no unique constraint), fallback to manual upsert.
     Returns: (written_count, reason, status_code, resp_text)
     """
     url = f"{SUPABASE_URL}/rest/v1/{TABLE}?on_conflict=fixture_id,market"
     headers = _headers()
     resp = requests.post(url, headers=headers, data=json.dumps(row))
+
     if resp.status_code >= 400:
         reason = _explain_postgrest_error(resp.text)
+        # 42P10 / NO_UNIQUE_FOR_ON_CONFLICT → manual upsert
+        if reason in ("NO_UNIQUE_FOR_ON_CONFLICT", "UPSERT_NEEDS_UNIQUE_CONSTRAINT"):
+            return _manual_upsert(row)
         return 0, reason, resp.status_code, resp.text
 
-    # With "return=representation", success returns an array of rows
+    # Success with "return=representation" → array of rows
     try:
         payload = resp.json()
         written = len(payload) if isinstance(payload, list) else (1 if payload else 0)
     except Exception:
-        written = 0
+        written = 1
     return written, "OK", resp.status_code, resp.text
 
 def build_row_from_prediction(fixture_id: int, market: str, block: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Map model/local fields to DB columns.
-    """
+    """Map model/local fields to DB columns."""
     return {
         "fixture_id": int(fixture_id or 0),
         "market": market,                                          # "over_2_5"
@@ -107,8 +149,8 @@ def build_row_from_prediction(fixture_id: int, market: str, block: Dict[str, Any
 
 def write_value_prediction(fixture_id: int, market: str, block: Optional[Dict[str, Any]]) -> Tuple[int, str]:
     """
-    Write one market row. Returns (written_count, reason).
-    Reasons when 0: MISSING_MARKET, NO_ODDS, NON_VALUE, HTTP_4XX, RLS_FORBIDDEN, etc.
+    High-level writer with explicit reasons for '0' writes.
+    Returns (written_count, reason).
     """
     if not isinstance(block, dict):
         logger.warning("✋ MISSING_MARKET block for fixture %s", fixture_id)
