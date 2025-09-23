@@ -391,8 +391,13 @@ def _local_over25_estimate(payload: Dict[str, Any]) -> Dict[str, Any]:
 # MODEL CALL (Responses first; Chat as last resort) – works with gpt-5-nano
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Try Responses API once using the most compatible shapes.
+    If we still get no usable output, return None so the caller
+    uses the local OU2.5 engine immediately (no Chat fallback).
+    """
     if not USE_LLM:
-        return None  # skip API entirely if instructed
+        return None
 
     has_text_format = _responses_supports_param("text")
     has_resp_format = _responses_supports_param("response_format")
@@ -403,99 +408,69 @@ def _call_model(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     user_blob = "Match data JSON follows.\n" + json.dumps(payload, ensure_ascii=False)
 
     msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
-    msg_user = {"role": "user", "content": [{"type": "input_text", "text": user_blob}]}
+    msg_user   = {"role": "user",   "content": [{"type": "input_text", "text": user_blob}]}
 
-    last_err: Optional[Exception] = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        # A) Responses + instructions + text.format (preferred per migration guide)
-        if has_text_format and has_instructions:
-            try:
-                resp = client.responses.create(
-                    model=MODEL_NAME,
-                    instructions=instructions_str,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": user_blob}]}],
-                    text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                    **{tokens_kw: 600},
-                )
-                parsed = _extract_parsed_from_responses(resp)
-                if parsed is not None:
-                    return parsed
-                text_out = _parse_responses_text(resp)
-                if text_out.strip():
-                    return json.loads(text_out)
-                last_err = RuntimeError("Responses (instructions+text.format) returned empty output.")
-            except Exception as e_a:
-                last_err = e_a
-
-        # B) Responses + messages + text.format
-        if has_text_format:
-            try:
-                resp = client.responses.create(
-                    model=MODEL_NAME,
-                    input=[msg_system, msg_user],
-                    text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                    **{tokens_kw: 600},
-                )
-                parsed = _extract_parsed_from_responses(resp)
-                if parsed is not None:
-                    return parsed
-                text_out = _parse_responses_text(resp)
-                if text_out.strip():
-                    return json.loads(text_out)
-                last_err = RuntimeError("Responses (messages+text.format) returned empty output.")
-            except Exception as e_b:
-                last_err = e_b
-
-        # C) Responses + legacy response_format
-        if has_resp_format:
-            try:
-                resp = client.responses.create(
-                    model=MODEL_NAME,
-                    input=[msg_system, msg_user],
-                    response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                    **{tokens_kw: 600},
-                )
-                parsed = _extract_parsed_from_responses(resp)
-                if parsed is not None:
-                    return parsed
-                text_out = _parse_responses_text(resp)
-                if text_out.strip():
-                    return json.loads(text_out)
-                last_err = RuntimeError("Responses (response_format) returned empty output.")
-            except Exception as e_c:
-                last_err = e_c
-
-        # D) Chat Completions (as last resort; supports parsed w/ json_schema)
+    # ---- 1) Responses + instructions + text.format (preferred) ----
+    if has_text_format and has_instructions:
         try:
-            cc = client.chat.completions.create(
+            resp = client.responses.create(
                 model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": user_blob},
-                ],
-                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
-                **_chat_tokens_kwargs(600),
+                instructions=instructions_str,
+                input=[{"role": "user", "content": [{"type": "input_text", "text": user_blob}]}],
+                text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                **{tokens_kw: 600},
             )
-            parsed = _extract_from_chat(cc)
+            parsed = _extract_parsed_from_responses(resp)
             if parsed is not None:
                 return parsed
-            last_err = RuntimeError("Chat with response_format returned empty output (no parsed/content).")
-        except TypeError as e_d1:
-            last_err = e_d1
-        except Exception as e_d1b:
-            last_err = e_d1b
+            text_out = _parse_responses_text(resp)
+            if text_out.strip():
+                return json.loads(text_out)
+            logger.warning("Responses (instructions+text.format) returned empty output.")
+        except Exception as e:
+            logger.debug("Responses (instructions+text.format) err: %s", e)
 
-        # Retry w/ backoff
-        if attempt < MAX_RETRIES:
-            sleep_for = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
-            logger.warning("Model call failed (attempt %d/%d): %s. Retrying in %.1fs", attempt, MAX_RETRIES, last_err, sleep_for)
-            time.sleep(sleep_for)
-        else:
-            break
+    # ---- 2) Responses + messages + text.format (second best) ----
+    if has_text_format:
+        try:
+            resp = client.responses.create(
+                model=MODEL_NAME,
+                input=[msg_system, msg_user],
+                text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                **{tokens_kw: 600},
+            )
+            parsed = _extract_parsed_from_responses(resp)
+            if parsed is not None:
+                return parsed
+            text_out = _parse_responses_text(resp)
+            if text_out.strip():
+                return json.loads(text_out)
+            logger.warning("Responses (messages+text.format) returned empty output.")
+        except Exception as e:
+            logger.debug("Responses (messages+text.format) err: %s", e)
 
-    logger.error("Exhausted model attempts; using local engine for fixture %s", payload.get("fixture_id"))
+    # ---- 3) Responses + legacy response_format (last try) ----
+    if has_resp_format:
+        try:
+            resp = client.responses.create(
+                model=MODEL_NAME,
+                input=[msg_system, msg_user],
+                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                **{tokens_kw: 600},
+            )
+            parsed = _extract_parsed_from_responses(resp)
+            if parsed is not None:
+                return parsed
+            text_out = _parse_responses_text(resp)
+            if text_out.strip():
+                return json.loads(text_out)
+            logger.warning("Responses (response_format) returned empty output.")
+        except Exception as e:
+            logger.debug("Responses (response_format) err: %s", e)
+
+    # Nothing useful — let caller use the local engine
     return None
+
 
 # ------------------------------------------------------------------------------
 # Public API (ONLY Over/Under 2.5)
