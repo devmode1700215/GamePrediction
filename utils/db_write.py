@@ -11,7 +11,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ENV (your keys from Render: SUPABASE_URL + SUPABASE_KEY)
+# ENV (Render secrets: SUPABASE_URL + SUPABASE_KEY)
 # ──────────────────────────────────────────────────────────────────────────────
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 
@@ -25,12 +25,14 @@ SUPABASE_KEY = (
 
 TABLE = os.getenv("VALUE_PREDICTIONS_TABLE", "value_predictions")
 
-# Behavior flags
-ALWAYS_WRITE = os.getenv("OU25_ALWAYS_WRITE", "0") == "1"             # write even when non-value
-ONLY_WRITE_VALUE = os.getenv("OU25_ONLY_WRITE_VALUE", "0") == "1"     # gate by po_value
+# Behavior flags / thresholds
+# Only keep predictions that are value *and* pass thresholds
+ONLY_WRITE_VALUE = os.getenv("OU25_ONLY_WRITE_VALUE", "1") == "1"       # default ON now
+ALWAYS_WRITE     = os.getenv("OU25_ALWAYS_WRITE", "0") == "1"           # overrides gates (use with care)
 
-# NEW: minimum edge (percent) required to write
-MIN_EDGE_PCT_TO_WRITE = float(os.getenv("OU25_MIN_EDGE_PCT_TO_WRITE", "5"))
+# Minimum edge and confidence to write (edge is in %; we normalize decimals)
+MIN_EDGE_PCT_TO_WRITE       = float(os.getenv("OU25_MIN_EDGE_PCT_TO_WRITE", "5"))
+MIN_CONFIDENCE_TO_WRITE     = int(os.getenv("OU25_MIN_CONFIDENCE_TO_WRITE", "70"))
 
 def _headers() -> Dict[str, str]:
     if not SUPABASE_URL:
@@ -50,7 +52,7 @@ def _explain_postgrest_error(text: str) -> str:
         data = json.loads(text)
     except Exception:
         data = {}
-    msg = (data.get("message") or "").lower()
+    msg  = (data.get("message") or "").lower()
     hint = (data.get("hint") or "").lower()
 
     if "no unique or exclusion constraint" in msg:
@@ -130,6 +132,9 @@ def _post_row(row: Dict[str, Any]) -> Tuple[int, str, int, str]:
         written = 1
     return written, "OK", resp.status_code, resp.text
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Gates (edge/confidence/value)
+# ──────────────────────────────────────────────────────────────────────────────
 def _edge_pct_from_block(block: Dict[str, Any]) -> float:
     """
     Normalize edge to % for gating:
@@ -142,6 +147,15 @@ def _edge_pct_from_block(block: Dict[str, Any]) -> float:
         return 0.0
     return (raw * 100.0) if (-1.0 <= raw <= 1.0) else raw
 
+def _confidence_from_block(block: Dict[str, Any]) -> int:
+    try:
+        return int(float(block.get("confidence") or 0))
+    except Exception:
+        return 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Row builder + public writer
+# ──────────────────────────────────────────────────────────────────────────────
 def build_row_from_prediction(fixture_id: int, market: str, block: Dict[str, Any]) -> Dict[str, Any]:
     """Map model/local fields to DB columns (edge stays as-is from the block)."""
     return {
@@ -159,9 +173,12 @@ def build_row_from_prediction(fixture_id: int, market: str, block: Dict[str, Any
 
 def write_value_prediction(fixture_id: int, market: str, block: Optional[Dict[str, Any]]) -> Tuple[int, str]:
     """
-    High-level writer with explicit reasons for '0' writes.
-    Enforces: only write when edge >= MIN_EDGE_PCT_TO_WRITE.
-    Returns (written_count, reason).
+    Write one market row. Returns (written_count, reason).
+    Enforces:
+      - usable odds
+      - confidence >= MIN_CONFIDENCE_TO_WRITE
+      - edge >= MIN_EDGE_PCT_TO_WRITE (if configured > 0)
+      - po_value == True (unless ALWAYS_WRITE)
     """
     if not isinstance(block, dict):
         logger.warning("✋ MISSING_MARKET block for fixture %s", fixture_id)
@@ -176,13 +193,19 @@ def write_value_prediction(fixture_id: int, market: str, block: Optional[Dict[st
         logger.info("ℹ️ NO_ODDS for fixture %s (market=%s)", fixture_id, market)
         return 0, "NO_ODDS"
 
-    # Enforce minimum edge % to write
+    # Confidence gate (NEW)
+    conf = _confidence_from_block(block)
+    if conf < MIN_CONFIDENCE_TO_WRITE and not ALWAYS_WRITE:
+        logger.info("ℹ️ CONFIDENCE_BELOW_MIN for fixture %s: %d < %d", fixture_id, conf, MIN_CONFIDENCE_TO_WRITE)
+        return 0, "CONFIDENCE_BELOW_MIN"
+
+    # Edge gate (still applied unless threshold set to 0)
     edge_pct = _edge_pct_from_block(block)
-    if edge_pct < MIN_EDGE_PCT_TO_WRITE:
+    if MIN_EDGE_PCT_TO_WRITE > 0 and edge_pct < MIN_EDGE_PCT_TO_WRITE and not ALWAYS_WRITE:
         logger.info("ℹ️ EDGE_BELOW_MIN for fixture %s: %.3f%% < %.3f%%", fixture_id, edge_pct, MIN_EDGE_PCT_TO_WRITE)
         return 0, "EDGE_BELOW_MIN"
 
-    # Optional additional gate: only write value bets (po_value==True)
+    # Value gate (po_value must be True by default)
     po_value = bool(block.get("po_value"))
     if ONLY_WRITE_VALUE and not po_value and not ALWAYS_WRITE:
         logger.info("ℹ️ NON_VALUE gated write for fixture %s (po_value=false)", fixture_id)
