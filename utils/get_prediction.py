@@ -1,10 +1,29 @@
 # utils/get_prediction.py
 # -*- coding: utf-8 -*-
+"""
+Environment variables you can set (Render → Environment or .env):
+
+OPENAI_API_KEY=sk-...
+MODEL_NAME=gpt-5-nano           # default in code
+OU25_USE_LLM=1                  # 1 to try the model; 0 to skip straight to local engine
+OU25_ALLOW_CHAT=0               # 1 to allow chat-completions fallback (off by default)
+
+# Guardrails & local engine tuning
+PREDICTION_MIN_ODDS=1.60        # informational guardrail; we still return a record if outside
+PREDICTION_MAX_ODDS=2.30
+OU25_EDGE_THRESHOLD=0.02        # >= 2% EV to call it value
+OU25_MAX_STAKE_PCT=1.5          # cap (percent of bankroll)
+OU25_EDGE_TO_STAKE_COEF=0.20    # stake% ≈ coef * (edge * 100)
+OU25_DEFAULT_VIG=0.05           # assumed overround if we can’t infer
+
+# Optional: if your DB layer only inserts when po_value=true,
+# you can force "insert anyway" behavior by treating even tiny positive EV as value.
+OU25_ALWAYS_VALUE=0             # set to 1 to mark po_value=true for EV >= 0 (careful!)
+"""
 
 import os
 import json
 import time
-import math
 import logging
 import inspect
 from typing import Any, Dict, Tuple, Optional, Iterable
@@ -23,23 +42,23 @@ logger.setLevel(logging.INFO)
 # Config (env-driven)
 # ------------------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# Default to gpt-5-nano
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-nano")
-MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))            # keep retries short
 RETRY_BACKOFF_SEC = float(os.getenv("OPENAI_RETRY_BACKOFF_SEC", "2.0"))
 
-# Odds guardrails (we only warn if outside)
+USE_LLM = os.getenv("OU25_USE_LLM", "1") == "1"
+ALLOW_CHAT = os.getenv("OU25_ALLOW_CHAT", "0") == "1"
+
+# Guardrails (informational)
 MIN_ODDS = float(os.getenv("PREDICTION_MIN_ODDS", "1.6"))
 MAX_ODDS = float(os.getenv("PREDICTION_MAX_ODDS", "2.3"))
 
 # Local engine tuning
-EDGE_THRESHOLD = float(os.getenv("OU25_EDGE_THRESHOLD", "0.02"))     # >=2% EV -> po_value true
-MAX_STAKE = float(os.getenv("OU25_MAX_STAKE_PCT", "1.5"))            # cap stake% (kelly-lite)
+EDGE_THRESHOLD = float(os.getenv("OU25_EDGE_THRESHOLD", "0.02"))
+MAX_STAKE = float(os.getenv("OU25_MAX_STAKE_PCT", "1.5"))
 EDGE_TO_STAKE_COEF = float(os.getenv("OU25_EDGE_TO_STAKE_COEF", "0.20"))
-DEFAULT_VIG = float(os.getenv("OU25_DEFAULT_VIG", "0.05"))           # assumed market overround
-
-# Flip to 0 to skip LLM entirely
-USE_LLM = os.getenv("OU25_USE_LLM", "1") == "1"
+DEFAULT_VIG = float(os.getenv("OU25_DEFAULT_VIG", "0.05"))
+ALWAYS_VALUE = os.getenv("OU25_ALWAYS_VALUE", "0") == "1"
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
@@ -79,32 +98,33 @@ PREDICTION_JSON_SCHEMA = {
     },
     "required": ["fixture_id", "predictions"]
 }
-STRICT_OUTPUT = True
+# Important: strict=False reduces "empty output" issues on some stacks.
+STRICT_OUTPUT = False
 
 SYSTEM_INSTRUCTIONS = (
     "You are an expert football betting analyst. "
     "Given structured match data (teams, form, injuries, H2H, league, venue, odds), "
     "evaluate ONLY the Over/Under 2.5 goals market. "
     f"Use odds guardrails of {MIN_ODDS}–{MAX_ODDS}. "
-    "Calibrate probabilities, compute edge vs. listed odds, set po_value true only for positive EV, "
-    "and keep bankroll_pct modest (0.25–1.5) unless edge is exceptional. "
-    "Return ONLY JSON conforming to the provided schema."
+    "Calibrate probability; compute edge vs listed odds; set po_value true only for positive EV; "
+    "stake modestly (0.25–1.5% unless edge exceptional). "
+    "Return ONLY JSON matching the provided schema."
 )
 
 # ------------------------------------------------------------------------------
 # Validation helpers
 # ------------------------------------------------------------------------------
 def _validate_prediction_block(block: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    required = ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
-    missing = [k for k in required if k not in block]
-    if missing:
-        return False, f"over_2_5: missing {missing}"
+    req = ["prediction", "confidence", "edge", "po_value", "odds", "bankroll_pct", "rationale"]
+    miss = [k for k in req if k not in block]
+    if miss:
+        return False, f"over_2_5: missing {miss}"
     try:
         if not (MIN_ODDS <= float(block["odds"]) <= MAX_ODDS):
-            logger.info("ℹ️ over_2_5 odds out of preferred range: %.3f (allowed %.2f–%.2f)",
+            logger.info("ℹ️ over_2_5 odds outside preferred range: %.3f (%.2f–%.2f)",
                         float(block["odds"]), MIN_ODDS, MAX_ODDS)
     except Exception:
-        logger.info("ℹ️ over_2_5 has non-numeric odds: %r", block.get("odds"))
+        logger.info("ℹ️ over_2_5 odds not numeric: %r", block.get("odds"))
     return True, None
 
 def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -114,9 +134,7 @@ def _validate_full_response(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     if "over_2_5" not in preds:
         return False, "Missing market over_2_5"
     ok, err = _validate_prediction_block(preds["over_2_5"])
-    if not ok:
-        return False, err
-    return True, None
+    return (ok, err)
 
 # ------------------------------------------------------------------------------
 # SDK capability introspection
@@ -128,7 +146,6 @@ def _supports_arg(fn, name: str) -> bool:
         return False
 
 def _responses_tokens_kw() -> str:
-    # Newer: max_output_tokens; older: max_tokens
     return "max_output_tokens" if _supports_arg(client.responses.create, "max_output_tokens") else "max_tokens"
 
 def _responses_supports_param(name: str) -> bool:
@@ -137,8 +154,7 @@ def _responses_supports_param(name: str) -> bool:
     except Exception:
         return False
 
-def _chat_tokens_kwargs(n: int = 700) -> dict:
-    # Newer Chat: max_completion_tokens; older: max_tokens
+def _chat_tokens_kwargs(n: int = 600) -> dict:
     try:
         if "max_completion_tokens" in inspect.signature(client.chat.completions.create).parameters:
             return {"max_completion_tokens": n}
@@ -147,7 +163,7 @@ def _chat_tokens_kwargs(n: int = 700) -> dict:
     return {"max_tokens": n}
 
 # ------------------------------------------------------------------------------
-# Generic traversal/extraction
+# Traversal/extraction helpers
 # ------------------------------------------------------------------------------
 def _iter_all_values(obj: Any) -> Iterable[Any]:
     if isinstance(obj, dict):
@@ -183,8 +199,9 @@ def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
             return obj
     try:
         for v in _iter_all_values(obj):
-            if isinstance(v, dict):
-                if "fixture_id" in v and isinstance(v.get("predictions"), dict) and "over_2_5" in v["predictions"]:
+            if isinstance(v, dict) and "fixture_id" in v:
+                preds = v.get("predictions")
+                if isinstance(preds, dict) and "over_2_5" in preds:
                     return v
     except Exception:
         pass
@@ -192,33 +209,28 @@ def _deep_find_prediction_obj(obj: Any) -> Optional[Dict[str, Any]]:
 
 def _extract_parsed_from_responses(resp) -> Optional[Dict[str, Any]]:
     parsed = getattr(resp, "output_parsed", None)
-    if parsed is not None:
+    if isinstance(parsed, dict):
         return parsed
 
-    output_list = getattr(resp, "output", None)
-    if output_list:
-        for item in output_list:
+    output = getattr(resp, "output", None)
+    if output:
+        for item in output:
             content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
             for chunk in content:
                 maybe = chunk.get("parsed", None) if isinstance(chunk, dict) else getattr(chunk, "parsed", None)
                 if isinstance(maybe, dict):
                     return maybe
-                if isinstance(maybe, list):
-                    for x in maybe:
-                        if isinstance(x, dict) and "fixture_id" in x and "predictions" in x:
-                            return x
 
     try:
         dumped = resp.model_dump() if hasattr(resp, "model_dump") else json.loads(
-            resp.model_dump_json() if hasattr(resp, "model_dump_json") else json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o)))
+            resp.model_dump_json() if hasattr(resp, "model_dump_json")
+            else json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o)))
         )
-    except Exception:
-        dumped = None
-
-    if dumped is not None:
         found = _deep_find_prediction_obj(dumped)
         if found:
             return found
+    except Exception:
+        pass
     return None
 
 def _parse_responses_text(resp) -> str:
@@ -226,86 +238,34 @@ def _parse_responses_text(resp) -> str:
     if isinstance(txt, str) and txt.strip():
         return txt
 
-    parts = []
-    output_list = getattr(resp, "output", None)
-    if output_list is None:
-        msg = getattr(resp, "message", None)
-        content = getattr(msg, "content", None) if msg is not None else None
-        if isinstance(content, str):
-            return content
-        return ""
-
-    for item in output_list:
-        content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
-        for chunk in content:
-            ctype = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
-            ctext = chunk.get("text", "") if isinstance(chunk, dict) else getattr(chunk, "text", "")
-            if ctype in ("output_text", "summary_text") and isinstance(ctext, str):
-                parts.append(ctext)
+    output = getattr(resp, "output", None)
+    parts: list[str] = []
+    if output:
+        for item in output:
+            content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", []) or []
+            for chunk in content:
+                t = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
+                s = chunk.get("text", "") if isinstance(chunk, dict) else getattr(chunk, "text", "")
+                if t in ("output_text", "summary_text") and isinstance(s, str):
+                    parts.append(s)
     return "".join(parts)
 
 def _extract_json_snippet(s: str) -> str:
     if not isinstance(s, str) or not s:
         return ""
-    start = s.find("{"); end = s.rfind("}")
-    return s[start:end+1] if (start != -1 and end != -1 and end > start) else s.strip()
-
-def _extract_from_chat(cc) -> Optional[Dict[str, Any]]:
-    try:
-        choices = getattr(cc, "choices", []) or []
-        for ch in choices:
-            msg = getattr(ch, "message", None)
-            if msg is None:
-                continue
-            parsed = getattr(msg, "parsed", None)
-            if isinstance(parsed, dict):
-                return parsed
-            content = getattr(msg, "content", None)
-            if isinstance(content, str) and content.strip():
-                try:
-                    return json.loads(_extract_json_snippet(content))
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return None
+    a = s.find("{"); b = s.rfind("}")
+    return s[a:b+1] if (a != -1 and b != -1 and b > a) else s.strip()
 
 # ------------------------------------------------------------------------------
-# Backstop + Local OU2.5 engine
+# Local engine (deterministic OU 2.5 from odds & light signals)
 # ------------------------------------------------------------------------------
-def _default_stub_over25(payload: Dict[str, Any], note: str = "Stub filled due to missing market; no value.") -> Dict[str, Any]:
-    def _num(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
-    odds = _num((payload.get("odds") or {}).get("over_2_5")) or MIN_ODDS
-    return {
-        "prediction": "Over",
-        "confidence": 0,
-        "edge": 0,
-        "po_value": False,
-        "odds": odds,
-        "bankroll_pct": 0,
-        "rationale": note
-    }
-
-def _apply_backstop_if_missing(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
-    data = dict(data)
-    preds = dict(data.get("predictions") or {})
-    if "over_2_5" not in preds:
-        logger.info("ℹ️ Backstop fill for missing market: over_2_5")
-        preds["over_2_5"] = _default_stub_over25(payload)
-    data["predictions"] = preds
-    return data
-
 def _safe_float(x, default=None):
     try:
         return float(x)
     except Exception:
         return default
 
-def _market_prob_from_odds(odds: Optional[float]) -> Optional[float]:
+def _p_from_odds(odds: Optional[float]) -> Optional[float]:
     o = _safe_float(odds)
     if not o or o <= 1.0:
         return None
@@ -324,156 +284,204 @@ def _infer_margin_from_1x2(one_x_two: Optional[Dict[str, Any]]) -> float:
         return float(min(max(margin, 0.0), 0.12)) or DEFAULT_VIG
     return DEFAULT_VIG
 
-def _local_over25_estimate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    odds_blob = payload.get("odds") or {}
-    over_price = _safe_float(odds_blob.get("over_2_5"), default=None)
+def _local_over25(payload: Dict[str, Any]) -> Dict[str, Any]:
+    odds = payload.get("odds") or {}
+    over_price = _safe_float(odds.get("over_2_5"))
     if not over_price:
-        return _default_stub_over25(payload, note="No Over 2.5 price available; produced safe stub.")
+        # Minimal safe result when feed lacks a price
+        over_price = MIN_ODDS
 
-    p_mkt_over = _market_prob_from_odds(over_price) or 0.5
-    margin_guess = _infer_margin_from_1x2(odds_blob.get("one_x_two"))
-    p_fair_over = max(min(p_mkt_over - margin_guess * 0.5, 0.975), 0.025)
+    p_mkt = _p_from_odds(over_price) or 0.5
+    margin = _infer_margin_from_1x2(odds.get("one_x_two"))
+    p_fair = max(min(p_mkt - 0.5 * margin, 0.975), 0.025)
 
-    btts_yes = None
-    btts_blob = odds_blob.get("btts")
-    if isinstance(btts_blob, dict):
-        btts_yes = _safe_float(btts_blob.get("Yes"))
-    p_btts = _market_prob_from_odds(btts_yes) if btts_yes else None
+    # Tilts
+    btts_yes = _safe_float((odds.get("btts") or {}).get("Yes"))
+    p_btts = _p_from_odds(btts_yes) if btts_yes else None
     tilt_btts = ((p_btts - 0.5) * 0.25) if (p_btts is not None) else 0.0
 
-    one_x_two = odds_blob.get("one_x_two") if isinstance(odds_blob.get("one_x_two"), dict) else {}
+    one_x_two = odds.get("one_x_two") if isinstance(odds.get("one_x_two"), dict) else {}
     fav_price = min([v for v in (_safe_float(one_x_two.get("Home")),
                                  _safe_float(one_x_two.get("Away"))) if v], default=None)
     tilt_fav = 0.0
     if fav_price:
-        if fav_price <= 1.55:
-            tilt_fav += 0.04
-        elif fav_price <= 1.75:
-            tilt_fav += 0.02
-        elif fav_price >= 2.60:
-            tilt_fav -= 0.02
+        if fav_price <= 1.55: tilt_fav += 0.04
+        elif fav_price <= 1.75: tilt_fav += 0.02
+        elif fav_price >= 2.60: tilt_fav -= 0.02
 
-    p_over = max(min(p_fair_over + tilt_btts + tilt_fav, 0.975), 0.025)
+    p_over = max(min(p_fair + tilt_btts + tilt_fav, 0.975), 0.025)
     ev = p_over * over_price - 1.0
-    po_value = bool(ev >= EDGE_THRESHOLD and MIN_ODDS <= over_price <= MAX_ODDS)
 
-    diff_from_mkt = abs(p_over - p_mkt_over)
-    confidence = int(max(35.0, min(90.0, 55.0 + 300.0 * diff_from_mkt)))
+    # Value rule (optionally "always value" if EV >= 0 and env says so)
+    po_value = (ev >= EDGE_THRESHOLD and MIN_ODDS <= over_price <= MAX_ODDS) or (ALWAYS_VALUE and ev >= 0.0)
+
+    # Confidence & stake
+    diff = abs(p_over - p_mkt)
+    confidence = int(max(35.0, min(90.0, 55.0 + 300.0 * diff)))
 
     stake_pct = 0.0
     if po_value:
         stake_pct = min(MAX_STAKE, max(0.25, EDGE_TO_STAKE_COEF * (ev * 100.0)))
 
-    rationale_bits = []
-    rationale_bits.append(f"Base p_over from price≈{p_mkt_over:.3f}, fair adj≈{p_fair_over:.3f}")
-    if p_btts is not None:
-        rationale_bits.append(f"BTTS tilt≈{tilt_btts:+.3f} (BTTS Yes p≈{p_btts:.2f})")
-    if fav_price:
-        rationale_bits.append(f"Fav tilt≈{tilt_fav:+.3f} (fav price {fav_price:.2f})")
-    rationale_bits.append(f"Final p_over≈{p_over:.3f}, EV≈{ev:.3f}")
+    rationale = [
+        f"Base p_over≈{p_mkt:.3f}, fair adj≈{p_fair:.3f}",
+        f"BTTS tilt≈{tilt_btts:+.3f}" if p_btts is not None else "BTTS tilt≈0.000",
+        f"Fav tilt≈{tilt_fav:+.3f}",
+        f"Final p_over≈{p_over:.3f}, EV≈{ev:.3f}"
+    ]
 
     return {
         "fixture_id": payload.get("fixture_id", 0),
         "predictions": {
             "over_2_5": {
-                "prediction": "Over",
+                "prediction": "Over",              # using Over price
                 "confidence": confidence,
                 "edge": round(ev, 4),
-                "po_value": po_value,
+                "po_value": bool(po_value),
                 "odds": over_price,
                 "bankroll_pct": round(stake_pct, 3),
-                "rationale": "; ".join(rationale_bits)
+                "rationale": "; ".join(rationale)
             }
         }
     }
 
 # ------------------------------------------------------------------------------
-# MODEL CALL (Responses first; Chat as last resort) – works with gpt-5-nano
+# Model call (Responses first; quick exit; optional Chat fallback)
 # ------------------------------------------------------------------------------
 def _call_model(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Try Responses API once using the most compatible shapes.
-    If we still get no usable output, return None so the caller
-    uses the local OU2.5 engine immediately (no Chat fallback).
-    """
     if not USE_LLM:
         return None
 
-    has_text_format = _responses_supports_param("text")
+    has_text = _responses_supports_param("text")
     has_resp_format = _responses_supports_param("response_format")
-    has_instructions = _responses_supports_param("instructions")
+    has_instr = _responses_supports_param("instructions")
     tokens_kw = _responses_tokens_kw()
 
-    instructions_str = SYSTEM_INSTRUCTIONS
     user_blob = "Match data JSON follows.\n" + json.dumps(payload, ensure_ascii=False)
 
-    msg_system = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]}
-    msg_user   = {"role": "user",   "content": [{"type": "input_text", "text": user_blob}]}
-
-    # ---- 1) Responses + instructions + text.format (preferred) ----
-    if has_text_format and has_instructions:
+    # 1) Responses: instructions + text.format (most reliable when supported)
+    if has_text and has_instr:
         try:
             resp = client.responses.create(
                 model=MODEL_NAME,
-                instructions=instructions_str,
+                instructions=SYSTEM_INSTRUCTIONS,
                 input=[{"role": "user", "content": [{"type": "input_text", "text": user_blob}]}],
-                text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                text={"format": {"type": "json_schema", "name": SCHEMA_NAME,
+                                 "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
                 **{tokens_kw: 600},
             )
             parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None:
+            if isinstance(parsed, dict):
                 return parsed
             text_out = _parse_responses_text(resp)
             if text_out.strip():
-                return json.loads(text_out)
+                return json.loads(_extract_json_snippet(text_out))
             logger.warning("Responses (instructions+text.format) returned empty output.")
         except Exception as e:
             logger.debug("Responses (instructions+text.format) err: %s", e)
 
-    # ---- 2) Responses + messages + text.format (second best) ----
-    if has_text_format:
+    # 2) Responses: messages + text.format
+    if has_text:
         try:
             resp = client.responses.create(
                 model=MODEL_NAME,
-                input=[msg_system, msg_user],
-                text={"format": {"type": "json_schema", "name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]},
+                    {"role": "user",   "content": [{"type": "input_text", "text": user_blob}]},
+                ],
+                text={"format": {"type": "json_schema", "name": SCHEMA_NAME,
+                                 "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
                 **{tokens_kw: 600},
             )
             parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None:
+            if isinstance(parsed, dict):
                 return parsed
             text_out = _parse_responses_text(resp)
             if text_out.strip():
-                return json.loads(text_out)
+                return json.loads(_extract_json_snippet(text_out))
             logger.warning("Responses (messages+text.format) returned empty output.")
         except Exception as e:
             logger.debug("Responses (messages+text.format) err: %s", e)
 
-    # ---- 3) Responses + legacy response_format (last try) ----
+    # 3) Responses: legacy response_format
     if has_resp_format:
         try:
             resp = client.responses.create(
                 model=MODEL_NAME,
-                input=[msg_system, msg_user],
-                response_format={"type": "json_schema", "json_schema": {"name": SCHEMA_NAME, "schema": PREDICTION_JSON_SCHEMA, "strict": STRICT_OUTPUT}},
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]},
+                    {"role": "user",   "content": [{"type": "input_text", "text": user_blob}]},
+                ],
+                response_format={"type": "json_schema",
+                                 "json_schema": {"name": SCHEMA_NAME,
+                                                 "schema": PREDICTION_JSON_SCHEMA,
+                                                 "strict": STRICT_OUTPUT}},
                 **{tokens_kw: 600},
             )
             parsed = _extract_parsed_from_responses(resp)
-            if parsed is not None:
+            if isinstance(parsed, dict):
                 return parsed
             text_out = _parse_responses_text(resp)
             if text_out.strip():
-                return json.loads(text_out)
+                return json.loads(_extract_json_snippet(text_out))
             logger.warning("Responses (response_format) returned empty output.")
         except Exception as e:
             logger.debug("Responses (response_format) err: %s", e)
 
-    # Nothing useful — let caller use the local engine
+    # 4) Responses: no schema/format — last attempt to coax any JSON
+    try:
+        raw_sys = SYSTEM_INSTRUCTIONS + " IMPORTANT: Reply ONLY with valid JSON for the required keys."
+        resp = client.responses.create(
+            model=MODEL_NAME,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": raw_sys}]},
+                {"role": "user",   "content": [{"type": "input_text", "text": user_blob}]},
+            ],
+            **{tokens_kw: 500},
+        )
+        text_out = _parse_responses_text(resp)
+        if text_out.strip():
+            return json.loads(_extract_json_snippet(text_out))
+        logger.warning("Responses (no-format) returned empty output.")
+    except Exception as e:
+        logger.debug("Responses (no-format) err: %s", e)
+
+    # Optional: Chat fallback if explicitly allowed
+    if ALLOW_CHAT:
+        try:
+            cc = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                    {"role": "user", "content": user_blob},
+                ],
+                response_format={"type": "json_schema",
+                                 "json_schema": {"name": SCHEMA_NAME,
+                                                 "schema": PREDICTION_JSON_SCHEMA,
+                                                 "strict": STRICT_OUTPUT}},
+                **_chat_tokens_kwargs(500),
+            )
+            # Prefer parsed if SDK provides it
+            choices = getattr(cc, "choices", []) or []
+            for ch in choices:
+                msg = getattr(ch, "message", None)
+                if msg is None:
+                    continue
+                parsed = getattr(msg, "parsed", None)
+                if isinstance(parsed, dict):
+                    return parsed
+                content = getattr(msg, "content", None)
+                if isinstance(content, str) and content.strip():
+                    return json.loads(_extract_json_snippet(content))
+            logger.warning("Chat with response_format returned empty output.")
+        except Exception as e:
+            logger.debug("Chat err: %s", e)
+
+    # Give up → caller will use local engine immediately
     return None
 
-
 # ------------------------------------------------------------------------------
-# Public API (ONLY Over/Under 2.5)
+# Public API
 # ------------------------------------------------------------------------------
 def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -481,6 +489,7 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Returns an object with ONLY the over_2_5 market.
     """
     try:
+        # Robust fixture_id
         fixture_id = match_data.get("fixture_id")
         try:
             fixture_id = int(fixture_id)
@@ -499,17 +508,16 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "constraints": {"min_odds": MIN_ODDS, "max_odds": MAX_ODDS},
         }
 
-        # 1) Try model (gpt-5-nano)
-        model_result = _call_model(payload)
+        # 1) Try model (fast, few attempts)
+        result = _call_model(payload)
 
-        # 2) If model silent/invalid, use local engine (deterministic)
-        result = model_result if isinstance(model_result, dict) else _local_over25_estimate(payload)
+        # 2) If model returned nothing/invalid, compute locally (deterministic)
+        if not isinstance(result, dict):
+            result = _local_over25(payload)
 
-        # Ensure correct fixture_id & market
+        # Ensure shape & validity
         if not isinstance(result.get("fixture_id"), int):
             result["fixture_id"] = fixture_id
-        result = _apply_backstop_if_missing(payload, result)
-
         ok, err = _validate_full_response(result)
         if not ok:
             logger.error("❌ Invalid prediction shape: %s", err)
@@ -523,10 +531,10 @@ def get_prediction(match_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 # ------------------------------------------------------------------------------
-# Smoke test (run: python utils/get_prediction.py)
+# Smoke test
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    dummy_match = {
+    dummy = {
         "fixture_id": 123456,
         "teams": {"home": "A FC", "away": "B United"},
         "odds": {
@@ -540,5 +548,5 @@ if __name__ == "__main__":
         "league": {"name": "Test League", "country": "TL", "round": "R1"},
         "venue": "Test Stadium"
     }
-    out = get_prediction(dummy_match)
+    out = get_prediction(dummy)
     print(json.dumps(out or {"error": "no output"}, ensure_ascii=False, indent=2))
