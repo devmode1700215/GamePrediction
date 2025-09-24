@@ -24,7 +24,7 @@ from utils.insert_match import insert_match
 from utils.get_matches_needing_results import get_matches_needing_results
 from utils.supabaseClient import supabase
 
-# Prefer the writer that logs explicit reasons (NON_VALUE, NO_ODDS, RLS_FORBIDDEN, etc.)
+# Prefer the writer that logs explicit reasons (EDGE_BELOW_MIN, CONFIDENCE_BELOW_MIN, NON_VALUE, etc.)
 try:
     from utils.db_write import write_value_prediction as write_value_prediction_with_reasons
     _HAS_REASONED_WRITER = True
@@ -33,14 +33,14 @@ except Exception:
     from utils.insert_value_predictions import insert_value_predictions as _legacy_insert_value_predictions
     _HAS_REASONED_WRITER = False
 
-# Optional: Overtime integration into matches_ot (safe if missing)
+# Overtime bulk ingest (keeps everything simple in one module)
 try:
-    from utils.overtime_integration import upsert_overtime_from_fixture
+    from utils.overtime_integration import ingest_all_overtime_soccer
     _HAS_OVERTIME = True
 except Exception:
     _HAS_OVERTIME = False
-    def upsert_overtime_from_fixture(_):  # type: ignore
-        return 0, "OT_NOT_ENABLED"
+    def ingest_all_overtime_soccer():  # type: ignore
+        return 0, 0
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -127,9 +127,17 @@ def main():
         supa_key_present = bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
         ot_key_present   = bool(os.getenv("OVERTIME_API_KEY"))
         logger.info(
-            "🚀 Starting system… (reasoned writer=%s, overtime=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
+            "🚀 Starting system… (writer_with_reasons=%s, overtime_module=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
             _HAS_REASONED_WRITER, _HAS_OVERTIME, supa_url_present, supa_key_present, ot_key_present
         )
+
+        # 0) Ingest ALL open Overtime soccer games into matches_ot (no linking yet)
+        if _HAS_OVERTIME:
+            try:
+                games, written = ingest_all_overtime_soccer()
+                logger.info("🧲 Overtime ingest complete: games=%s, rows_written=%s", games, written)
+            except Exception as e:
+                logger.warning("⚠️ Overtime ingest failed: %s", e)
 
         # 1) Update results first
         update_results_for_finished_matches()
@@ -215,13 +223,13 @@ def main():
                 home["injuries"] = get_team_injuries(home["id"], season)
                 away["injuries"] = get_team_injuries(away["id"], season)
 
-                # Odds + H2H
+                # Odds + H2H (from your existing provider)
                 odds = get_match_odds(fixture_id) or {}
                 h2h = get_head_to_head(home["id"], away["id"]) or []
 
                 match_json = {
                     "fixture_id": fixture_id,
-                    "date": base["date"],            # ISO string, used for Overtime matching
+                    "date": base["date"],            # ISO string UTC
                     "league": base["league"],
                     "venue": base["venue"],
                     "home_team": home,
@@ -238,13 +246,6 @@ def main():
                         logger.info(f"✅ Inserted match {fixture_id}")
                     except Exception as e:
                         logger.error(f"❌ Error inserting match {fixture_id}: {e}")
-
-                # NEW: Upsert Overtime into separate table matches_ot (safe, independent)
-                try:
-                    wrote_ot, reason_ot = upsert_overtime_from_fixture(match_json)
-                    logger.info("🏟️ Overtime matches_ot wrote: %s (reason=%s) for fixture %s", wrote_ot, reason_ot, fixture_id)
-                except Exception as e:
-                    logger.warning("⚠️ Overtime upsert failed for fixture %s: %s", fixture_id, e)
 
                 # Only predict if Over 2.5 odds exist (save tokens)
                 if not _has_over25_price(match_json["odds"]):
