@@ -5,6 +5,7 @@ import os
 import re
 import json
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -14,10 +15,10 @@ log = logging.getLogger(__name__)
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
 OVERTIME_API_BASE = os.getenv("OVERTIME_API_BASE", "https://api.overtime.io")
-OVERTIME_API_KEY = os.getenv("OVERTIME_API_KEY", "")
-OVERTIME_NETWORK_ID = int(os.getenv("OVERTIME_NETWORK_ID", "10"))  # 10=Optimism
-OVERTIME_SPORT = os.getenv("OVERTIME_SPORT", "Soccer")
-OVERTIME_REFERRER_ID = os.getenv("OVERTIME_REFERRER_ID", "").strip()
+OVERTIME_API_KEY  = os.getenv("OVERTIME_API_KEY", "")
+OVERTIME_NETWORK  = int(os.getenv("OVERTIME_NETWORK_ID", "10"))  # 10 = Optimism
+OVERTIME_SPORT    = os.getenv("OVERTIME_SPORT", "Soccer")
+OVERTIME_REFERRER = os.getenv("OVERTIME_REFERRER_ID", "").strip()
 
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = (
@@ -42,232 +43,107 @@ if SUPABASE_KEY:
     })
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-
-def _bet_urls(game_id: str, network_id: int) -> Dict[str, str]:
-    base = "https://www.overtimemarkets.xyz/#/markets"
-    url = f"{base}?gameId={game_id}&networkId={network_id}"
-    if OVERTIME_REFERRER_ID:
-        url += f"&referrerId={OVERTIME_REFERRER_ID}"
-    return {"bet_url": url, "bet_url_fallback": base}
-
-def _overtime_get_markets(network_id: int) -> List[dict]:
-    if not OVERTIME_API_KEY:
-        raise RuntimeError("Missing OVERTIME_API_KEY")
-    url = f"{OVERTIME_API_BASE.rstrip('/')}/overtime-v2/networks/{network_id}/markets"
-    r = _ot.get(url, params={"ungroup": "true"}, timeout=40)
-    r.raise_for_status()
-    data = r.json()
-    # keep only our sport and open/ongoing markets
-    out: List[dict] = []
-    for m in (data if isinstance(data, list) else []):
-        try:
-            if m.get("sport") != OVERTIME_SPORT:
-                continue
-            status_code = (m.get("statusCode") or "").lower()
-            if status_code not in {"open", "ongoing"} and not m.get("isOpen", False):
-                continue
-            out.append(m)
-        except Exception:
-            continue
-    return out
-
-def _get_name_lower(o: dict) -> str:
-    # Try common outcome name keys; fall back to label/side
-    for k in ("name", "outcomeName", "label", "side", "key"):
-        v = o.get(k)
-        if isinstance(v, str):
-            return v.lower()
-    return ""
-
 def _safe_float(x) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return None
 
-def _extract_three_way_winner(m: dict) -> Optional[dict]:
-    """Map 3-way winner odds to {home, draw, away}."""
-    odds = m.get("odds") or []
-    if len(odds) < 3:
-        return None
-    # Prefer names if present
-    home = draw = away = None
-    for o in odds:
-        n = _get_name_lower(o)
-        dec = _safe_float(o.get("decimal"))
-        if dec is None:
-            continue
-        if n in ("home", "1", "team1", "local"):
-            home = dec
-        elif n in ("draw", "x"):
-            draw = dec
-        elif n in ("away", "2", "team2", "visitor"):
-            away = dec
-    # Fallback by position if names missing
-    if home is None or draw is None or away is None:
+def _bet_url(game_id: str, network_id: int) -> str:
+    base = "https://www.overtimemarkets.xyz/#/markets"
+    url = f"{base}?gameId={game_id}&networkId={network_id}"
+    if OVERTIME_REFERRER:
+        url += f"&referrerId={OVERTIME_REFERRER}"
+    return url
+
+def _overtime_get_markets() -> List[dict]:
+    """Fetch all open/ongoing Overtime markets for the configured network & sport."""
+    if not OVERTIME_API_KEY:
+        raise RuntimeError("Missing OVERTIME_API_KEY")
+    url = f"{OVERTIME_API_BASE.rstrip('/')}/overtime-v2/networks/{OVERTIME_NETWORK}/markets"
+    r = _ot.get(url, params={"ungroup": "true"}, timeout=45)
+    r.raise_for_status()
+    data = r.json()
+    out = []
+    for m in (data if isinstance(data, list) else []):
         try:
-            home = home or _safe_float(odds[0].get("decimal"))
-            draw = draw or _safe_float(odds[1].get("decimal"))
-            away = away or _safe_float(odds[2].get("decimal"))
-        except Exception:
-            return None
-    if None in (home, draw, away):
-        return None
-    return {"home": home, "draw": draw, "away": away}
-
-def _parse_line_to_float(x) -> Optional[float]:
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        try:
-            return float(x.replace(",", "."))
-        except Exception:
-            return None
-    return None
-
-def _looks_like_ou25_market(m: dict) -> bool:
-    # Heuristics: market name mentions over/under + 2.5 OR explicit line == 2.5
-    name = " ".join(str(m.get(k, "")) for k in ("marketName", "marketLabel", "type", "marketType")).lower()
-    line = _parse_line_to_float(m.get("line") or m.get("total") or m.get("handicap"))
-    has_ou = any(tok in name for tok in ("over", "under", "total"))
-    has_25 = ("2.5" in name) or (line is not None and abs(line - 2.5) < 1e-6)
-    return has_ou and has_25
-
-def _extract_ou25(m: dict) -> Optional[dict]:
-    """Map OU 2.5 to {over, under}."""
-    if not _looks_like_ou25_market(m):
-        return None
-    odds = m.get("odds") or []
-    if len(odds) < 2:
-        return None
-    over = under = None
-    for o in odds:
-        n = _get_name_lower(o)
-        dec = _safe_float(o.get("decimal"))
-        if dec is None:
-            continue
-        if n.startswith("over"):
-            over = dec
-        elif n.startswith("under"):
-            under = dec
-    # Fallback by index
-    if over is None or under is None:
-        try:
-            over = over or _safe_float(odds[0].get("decimal"))
-            under = under or _safe_float(odds[1].get("decimal"))
-        except Exception:
-            return None
-    if None in (over, under):
-        return None
-    return {"over": over, "under": under}
-
-def _looks_like_btts_market(m: dict) -> bool:
-    # Heuristics: name mentions 'both teams to score'/'btts'/'gg'
-    name = " ".join(str(m.get(k, "")) for k in ("marketName", "marketLabel", "type", "marketType")).lower()
-    return any(tok in name for tok in ("both teams to score", "btts", "gg"))
-
-def _extract_btts(m: dict) -> Optional[dict]:
-    """Map BTTS to {yes, no}."""
-    if not _looks_like_btts_market(m):
-        return None
-    odds = m.get("odds") or []
-    if len(odds) < 2:
-        return None
-    yes = no = None
-    for o in odds:
-        n = _get_name_lower(o)
-        dec = _safe_float(o.get("decimal"))
-        if dec is None:
-            continue
-        if n in ("yes", "y", "gg", "true"):
-            yes = dec
-        elif n in ("no", "n", "ng", "false"):
-            no = dec
-    # Fallback by index
-    if yes is None or no is None:
-        try:
-            yes = yes or _safe_float(odds[0].get("decimal"))
-            no = no or _safe_float(odds[1].get("decimal"))
-        except Exception:
-            return None
-    if None in (yes, no):
-        return None
-    return {"yes": yes, "no": no}
-
-def _bundle_odds_for_game(all_markets: List[dict], game_id: str) -> Dict[str, Any]:
-    """Collect winner + OU2.5 + BTTS from any markets that share the same gameId (or are child markets)."""
-    out: Dict[str, Any] = {}
-    siblings = [m for m in all_markets if str(m.get("gameId")) == str(game_id)]
-    for m in siblings:
-        try:
-            # 3-way winner
-            if "winner" not in out:
-                winner = _extract_three_way_winner(m)
-                if winner:
-                    out["winner"] = winner
-            # OU 2.5
-            if "ou_2_5" not in out:
-                ou = _extract_ou25(m)
-                if ou:
-                    out["ou_2_5"] = ou
-            # BTTS
-            if "btts" not in out:
-                btts = _extract_btts(m)
-                if btts:
-                    out["btts"] = btts
-            # Also scan child markets if present
-            for cm in m.get("childMarkets") or []:
-                if "ou_2_5" not in out:
-                    ou = _extract_ou25(cm)
-                    if ou:
-                        out["ou_2_5"] = ou
-                if "btts" not in out:
-                    btts = _extract_btts(cm)
-                    if btts:
-                        out["btts"] = btts
+            if m.get("sport") != OVERTIME_SPORT:
+                continue
+            status = (m.get("statusCode") or "").lower()
+            if status not in {"open", "ongoing"} and not m.get("isOpen", False):
+                continue
+            out.append(m)
         except Exception:
             continue
     return out
 
-def _closest_match(markets: List[dict], home: str, away: str, kickoff_iso: str) -> Optional[dict]:
-    hn, an = _norm(home), _norm(away)
-    try:
-        t_target = datetime.fromisoformat(kickoff_iso.replace("Z", "+00:00"))
-    except Exception:
-        t_target = None
+def _bundle_odds(markets_for_game: List[dict]) -> Dict[str, Any]:
+    """
+    Collect odds for a single gameId:
+      - winner: {home, draw, away}
+      - ou_2_5: {over, under}
+      - btts:   {yes, no}
+    Scans sibling markets and childMarkets.
+    """
+    out: Dict[str, Any] = {}
 
-    best, best_score = None, float("-inf")
-    for m in markets:
-        mh, ma = _norm(m.get("homeTeam", "")), _norm(m.get("awayTeam", ""))
-        if not mh or not ma:
-            continue
-        team_ok = ((hn == mh and an == ma) or (hn in mh and an in ma) or (mh in hn and ma in an))
-        if not team_ok:
-            continue
+    def extract_winner(m):
+        if "winner" in out: return
+        odds = m.get("odds") or []
+        if len(odds) >= 3:
+            h = _safe_float(odds[0].get("decimal"))
+            d = _safe_float(odds[1].get("decimal"))
+            a = _safe_float(odds[2].get("decimal"))
+            if None not in (h, d, a):
+                out["winner"] = {"home": h, "draw": d, "away": a}
 
-        score = 0.0
-        if t_target and m.get("maturityDate"):
-            try:
-                t_m = datetime.fromisoformat(m["maturityDate"].replace("Z", "+00:00"))
-                diff = abs((t_m - t_target).total_seconds())
-                score -= diff / 60.0  # minutes distance
-            except Exception:
-                pass
-        if len(m.get("odds") or []) >= 3:
-            score += 50.0
-        if score > best_score:
-            best, best_score = m, score
-    return best
+    def looks_ou25(m):
+        name = " ".join(str(m.get(k, "")) for k in ("marketName", "marketLabel", "type", "marketType")).lower()
+        line = m.get("line") or m.get("total") or m.get("handicap")
+        try:
+            line = float(str(line).replace(",", "."))
+        except Exception:
+            line = None
+        return (("over" in name or "under" in name or "total" in name) and
+                (("2.5" in name) or (line is not None and abs(line - 2.5) < 1e-6)))
 
-def _sb_upsert_row(row: Dict[str, Any]) -> Tuple[int, str]:
+    def extract_ou25(m):
+        if "ou_2_5" in out: return
+        if not looks_ou25(m): return
+        odds = m.get("odds") or []
+        if len(odds) >= 2:
+            over = _safe_float(odds[0].get("decimal"))
+            under = _safe_float(odds[1].get("decimal"))
+            if None not in (over, under):
+                out["ou_2_5"] = {"over": over, "under": under}
+
+    def looks_btts(m):
+        name = " ".join(str(m.get(k, "")) for k in ("marketName", "marketLabel", "type", "marketType")).lower()
+        return ("both teams to score" in name) or ("btts" in name) or ("gg" in name)
+
+    def extract_btts(m):
+        if "btts" in out: return
+        if not looks_btts(m): return
+        odds = m.get("odds") or []
+        if len(odds) >= 2:
+            yes = _safe_float(odds[0].get("decimal"))
+            no  = _safe_float(odds[1].get("decimal"))
+            if None not in (yes, no):
+                out["btts"] = {"yes": yes, "no": no}
+
+    for m in markets_for_game:
+        extract_winner(m)
+        extract_ou25(m)
+        extract_btts(m)
+        for cm in (m.get("childMarkets") or []):
+            extract_ou25(cm)
+            extract_btts(cm)
+    return out
+
+def _sb_upsert_matches_ot(row: Dict[str, Any]) -> Tuple[int, str]:
+    """Upsert one row into matches_ot. Falls back to manual upsert if unique index is missing."""
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
-
-    # native upsert
+        return 0, "NO_SUPABASE"
     url = f"{SUPABASE_URL}/rest/v1/{OT_TABLE}?on_conflict=game_id"
     r = _sb.post(url, data=json.dumps(row))
     if r.status_code < 400:
@@ -276,14 +152,11 @@ def _sb_upsert_row(row: Dict[str, Any]) -> Tuple[int, str]:
             return (len(payload) if isinstance(payload, list) else 1), "OK"
         except Exception:
             return 1, "OK"
-
-    # 42P10: no unique index → manual upsert
-    msg = (r.text or "").lower()
-    if "no unique or exclusion constraint" in msg or ("upsert" in msg and "unique" in msg):
-        del_url = f"{SUPABASE_URL}/rest/v1/{OT_TABLE}?game_id=eq.{row['game_id']}"
-        _sb.delete(del_url, headers={"Prefer": "return=minimal"})
-        ins_url = f"{SUPABASE_URL}/rest/v1/{OT_TABLE}"
-        ins = _sb.post(ins_url, data=json.dumps(row))
+    # Manual upsert if unique index missing
+    if "no unique or exclusion constraint" in (r.text or "").lower():
+        _sb.delete(f"{SUPABASE_URL}/rest/v1/{OT_TABLE}?game_id=eq.{row['game_id']}",
+                   headers={"Prefer": "return=minimal"})
+        ins = _sb.post(f"{SUPABASE_URL}/rest/v1/{OT_TABLE}", data=json.dumps(row))
         if ins.status_code < 400:
             try:
                 payload = ins.json()
@@ -291,60 +164,115 @@ def _sb_upsert_row(row: Dict[str, Any]) -> Tuple[int, str]:
             except Exception:
                 return 1, "MANUAL_UPSERT_OK"
         return 0, f"INSERT_FAIL:{ins.text}"
-
     return 0, f"HTTP_{r.status_code}:{r.text}"
 
-# ── public API ────────────────────────────────────────────────────────────────
-def build_matches_ot_row(ot_market: dict, odds_bundle: Dict[str, Any], fixture_id: Optional[int] = None) -> Dict[str, Any]:
-    urls = _bet_urls(ot_market.get("gameId"), int(ot_market.get("networkId") or OVERTIME_NETWORK_ID))
-    return {
-        "game_id": ot_market.get("gameId"),
-        "network_id": int(ot_market.get("networkId") or OVERTIME_NETWORK_ID),
-        "sport": ot_market.get("sport"),
-        "league": ot_market.get("leagueName"),
-        "maturity": ot_market.get("maturityDate"),
-        "home_team": ot_market.get("homeTeam"),
-        "away_team": ot_market.get("awayTeam"),
-        # Odds JSONB now bundles: winner, ou_2_5, btts (include only found keys)
-        "odds": odds_bundle,
-        "bet_url": urls["bet_url"],
-        "bet_url_fallback": urls["bet_url_fallback"],
-        "fixture_id": int(fixture_id) if fixture_id is not None else None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+# ── PUBLIC 1: Ingest ALL open Soccer games into matches_ot ───────────────────
+def ingest_all_overtime_soccer() -> Tuple[int, int]:
+    """
+    Fetch all open/ongoing Soccer markets from Overtime,
+    group by gameId, bundle odds, and upsert into matches_ot.
+    Returns: (games_seen, rows_written)
+    """
+    markets = _overtime_get_markets()
+    if not markets:
+        log.info("No open Overtime %s markets.", OVERTIME_SPORT)
+        return 0, 0
 
+    # group by gameId
+    by_gid: Dict[str, List[dict]] = defaultdict(list)
+    for m in markets:
+        gid = str(m.get("gameId"))
+        if gid:
+            by_gid[gid].append(m)
+
+    written = 0
+    for gid, group in by_gid.items():
+        try:
+            base = group[0]
+            bundle = _bundle_odds(group)
+
+            row = {
+                "game_id": gid,
+                "network_id": int(base.get("networkId") or OVERTIME_NETWORK),
+                "sport": base.get("sport"),
+                "league": base.get("leagueName"),
+                "maturity": base.get("maturityDate"),
+                "home_team": base.get("homeTeam"),
+                "away_team": base.get("awayTeam"),
+                "odds": bundle,  # {"winner": {...}, "ou_2_5": {...}, "btts": {...}}
+                "bet_url": _bet_url(gid, int(base.get("networkId") or OVERTIME_NETWORK)),
+                "bet_url_fallback": "https://www.overtimemarkets.xyz/#/markets",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            w, reason = _sb_upsert_matches_ot(row)
+            if w == 0:
+                log.warning("Overtime upsert failed for %s: %s", gid, reason)
+            else:
+                log.info("Overtime upsert %s: %s", gid, reason)
+            written += (1 if w > 0 else 0)
+        except Exception as e:
+            log.exception("Error processing Overtime game %s: %s", gid, e)
+
+    log.info("Overtime ingest complete. games=%s, written=%s", len(by_gid), written)
+    return len(by_gid), written
+
+# ── PUBLIC 2: (kept) Upsert a single game by matching a legacy fixture ───────
 def upsert_overtime_from_fixture(match_json: dict) -> Tuple[int, str]:
     """
-    From your existing fixture JSON:
-    1) fetch all Overtime markets
-    2) find best match by team names & kickoff
-    3) collect winner + OU2.5 + BTTS for the same gameId
-    4) upsert to public.matches_ot
-    Returns (written_count, reason).
+    Given your existing fixture JSON, try to find the Overtime game
+    (by team names/time), bundle odds, and upsert one row to matches_ot.
+    Returns (written_count, reason). Keeps it simple (no heavy fuzzy here).
     """
     home = (match_json.get("home_team") or {}).get("name") or (match_json.get("home_team") or {}).get("team")
     away = (match_json.get("away_team") or {}).get("name") or (match_json.get("away_team") or {}).get("team")
     kickoff = match_json.get("date")
-    fixture_id = match_json.get("fixture_id")
-
     if not (home and away and kickoff):
         return 0, "MISSING_FIXTURE_FIELDS"
 
-    markets = _overtime_get_markets(OVERTIME_NETWORK_ID)
-    best = _closest_match(markets, home, away, kickoff)
+    markets = _overtime_get_markets()
+    # naive normalized compare + ±8h window
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    def _mins(a: str, b: str) -> float:
+        try:
+            ta = datetime.fromisoformat(a.replace("Z","+00:00"))
+            tb = datetime.fromisoformat(b.replace("Z","+00:00"))
+            return abs((ta - tb).total_seconds()) / 60.0
+        except Exception:
+            return 9e9
+
+    hn, an = _norm(home), _norm(away)
+    best = None
+    best_minutes = 9e9
+    for m in markets:
+        mh, ma = _norm(m.get("homeTeam","")), _norm(m.get("awayTeam",""))
+        if not mh or not ma: continue
+        # accept same-order or swapped
+        teams_ok = (hn == mh and an == ma) or (hn == ma and an == mh)
+        if not teams_ok: continue
+        dmin = _mins(kickoff, m.get("maturityDate",""))
+        if dmin <= 480 and dmin < best_minutes:  # ±8h
+            best, best_minutes = m, dmin
+
     if not best:
         return 0, "NO_MATCH_FOUND"
 
-    # Bundle all relevant odds for this gameId
-    game_id = best.get("gameId")
-    odds_bundle = _bundle_odds_for_game(markets, game_id)
-    if not odds_bundle:
-        # Still store the row with minimal info (so you have the bet link)
-        odds_bundle = {}
+    gid = best.get("gameId")
+    network_id = int(best.get("networkId") or OVERTIME_NETWORK)
+    bundle = _bundle_odds([mm for mm in markets if str(mm.get("gameId")) == str(gid)])
 
-    best = dict(best)
-    best["networkId"] = best.get("networkId") or OVERTIME_NETWORK_ID
-
-    row = build_matches_ot_row(best, odds_bundle=odds_bundle, fixture_id=fixture_id)
-    written, reason = _sb_upsert_row(row)
-    return written, reason
+    row = {
+        "game_id": gid,
+        "network_id": network_id,
+        "sport": best.get("sport"),
+        "league": best.get("leagueName"),
+        "maturity": best.get("maturityDate"),
+        "home_team": best.get("homeTeam"),
+        "away_team": best.get("awayTeam"),
+        "odds": bundle,
+        "bet_url": _bet_url(gid, network_id),
+        "bet_url_fallback": "https://www.overtimemarkets.xyz/#/markets",
+        "fixture_id": int(match_json.get("fixture_id")) if match_json.get("fixture_id") else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return _sb_upsert_matches_ot(row)
