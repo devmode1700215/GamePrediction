@@ -24,13 +24,23 @@ from utils.insert_match import insert_match
 from utils.get_matches_needing_results import get_matches_needing_results
 from utils.supabaseClient import supabase
 
-# Prefer the new writer with explicit reason codes
+# Prefer the writer that logs explicit reasons (NON_VALUE, NO_ODDS, RLS_FORBIDDEN, etc.)
 try:
     from utils.db_write import write_value_prediction as write_value_prediction_with_reasons
     _HAS_REASONED_WRITER = True
 except Exception:
+    # Fallback: your original insert (no detailed reasons)
     from utils.insert_value_predictions import insert_value_predictions as _legacy_insert_value_predictions
     _HAS_REASONED_WRITER = False
+
+# Optional: Overtime integration into matches_ot (safe if missing)
+try:
+    from utils.overtime_integration import upsert_overtime_from_fixture
+    _HAS_OVERTIME = True
+except Exception:
+    _HAS_OVERTIME = False
+    def upsert_overtime_from_fixture(_):  # type: ignore
+        return 0, "OT_NOT_ENABLED"
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -66,7 +76,7 @@ def safe_extract_match_data(match):
 
         return {
             "fixture_id": fixture_id,
-            "date": date,
+            "date": date,  # ISO8601 string from provider (UTC)
             "league": {
                 "name": league.get("name", "Unknown"),
                 "country": league.get("country", "Unknown"),
@@ -82,6 +92,7 @@ def safe_extract_match_data(match):
         return None
 
 def update_results_for_finished_matches():
+    """Pull results for matches that need them and store into DB."""
     try:
         matches = get_matches_needing_results()
         if not matches:
@@ -114,13 +125,16 @@ def main():
         # quick sanity that Render env is wired
         supa_url_present = bool(os.getenv("SUPABASE_URL"))
         supa_key_present = bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
-        logger.info("🚀 Starting system… (reasoned writer=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s)",
-                    _HAS_REASONED_WRITER, supa_url_present, supa_key_present)
+        ot_key_present   = bool(os.getenv("OVERTIME_API_KEY"))
+        logger.info(
+            "🚀 Starting system… (reasoned writer=%s, overtime=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
+            _HAS_REASONED_WRITER, _HAS_OVERTIME, supa_url_present, supa_key_present, ot_key_present
+        )
 
         # 1) Update results first
         update_results_for_finished_matches()
 
-        # 2) Build a 48h window (UTC)
+        # 2) Build a 48h window (UTC, timezone-aware)
         now = datetime.now(timezone.utc)
         d0 = now.strftime("%Y-%m-%d")
         d1 = (now + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -207,7 +221,7 @@ def main():
 
                 match_json = {
                     "fixture_id": fixture_id,
-                    "date": base["date"],
+                    "date": base["date"],            # ISO string, used for Overtime matching
                     "league": base["league"],
                     "venue": base["venue"],
                     "home_team": home,
@@ -225,7 +239,14 @@ def main():
                     except Exception as e:
                         logger.error(f"❌ Error inserting match {fixture_id}: {e}")
 
-                # Only predict if Over 2.5 odds exist
+                # NEW: Upsert Overtime into separate table matches_ot (safe, independent)
+                try:
+                    wrote_ot, reason_ot = upsert_overtime_from_fixture(match_json)
+                    logger.info("🏟️ Overtime matches_ot wrote: %s (reason=%s) for fixture %s", wrote_ot, reason_ot, fixture_id)
+                except Exception as e:
+                    logger.warning("⚠️ Overtime upsert failed for fixture %s: %s", fixture_id, e)
+
+                # Only predict if Over 2.5 odds exist (save tokens)
                 if not _has_over25_price(match_json["odds"]):
                     logger.info(f"🪙 Skipping GPT for {fixture_id}: no usable Over 2.5 odds.")
                     continue
@@ -245,9 +266,13 @@ def main():
                     logger.info("✍️ value_predictions wrote: %s (reason=%s) for fixture %s", written, reason, fixture_id)
                 else:
                     # legacy path if you didn't add db_write.py
-                    from utils.insert_value_predictions import insert_value_predictions as legacy_insert
-                    wrote = legacy_insert(prediction)
-                    logger.info("✍️ value_predictions wrote: %s (reason=LEGACY_PATH) for fixture %s", wrote, fixture_id)
+                    try:
+                        wrote = _legacy_insert_value_predictions(prediction)
+                        why = "LEGACY_PATH"
+                    except Exception as e:
+                        wrote = 0
+                        why = f"LEGACY_EXCEPTION:{e}"
+                    logger.info("✍️ value_predictions wrote: %s (reason=%s) for fixture %s", wrote, why, fixture_id)
 
                 successful += 1
 
