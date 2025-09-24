@@ -10,8 +10,8 @@ from utils.supabaseClient import supabase
 # --- Settings ---------------------------------------------------------------
 START_DATE       = os.getenv("BANKROLL_START_DATE", "2025-06-22")  # inclusive
 EXCLUDE_DATES: Set[str] = set(filter(None, os.getenv("BANKROLL_EXCLUDE_DATES", "2025-08-08").split(",")))
-ODDS_MIN         = float(os.getenv("BANKROLL_ODDS_MIN", "1.6"))
-ODDS_MAX         = float(os.getenv("BANKROLL_ODDS_MAX", "2.3"))
+ODDS_MIN         = float(os.getenv("BANKROLL_ODDS_MIN", "1.3"))
+ODDS_MAX         = float(os.getenv("BANKROLL_ODDS_MAX", "4"))
 CONF_MIN         = float(os.getenv("BANKROLL_CONF_MIN", "70"))
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL_START", "100"))
 BATCH_SIZE       = int(os.getenv("BANKROLL_BATCH_SIZE", "1000"))
