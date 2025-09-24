@@ -33,14 +33,19 @@ except Exception:
     from utils.insert_value_predictions import insert_value_predictions as _legacy_insert_value_predictions
     _HAS_REASONED_WRITER = False
 
-# Overtime bulk ingest (keeps everything simple in one module)
+# Overtime helpers (single module; includes ingest + DB-based linker)
 try:
-    from utils.overtime_integration import ingest_all_overtime_soccer
+    from utils.overtime_integration import (
+        ingest_all_overtime_soccer,
+        link_overtime_to_fixtures_from_db,
+    )
     _HAS_OVERTIME = True
 except Exception:
     _HAS_OVERTIME = False
-    def ingest_all_overtime_soccer():  # type: ignore
+    def ingest_all_overtime_soccer():
         return 0, 0
+    def link_overtime_to_fixtures_from_db(window_days: int = 2):
+        return 0, 0, 0
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -117,6 +122,43 @@ def _has_over25_price(odds_dict):
     except Exception:
         return False
 
+def _try_enrich_over25_with_overtime(fixture_id: int, odds: dict) -> dict:
+    """
+    If fixture is linked to an Overtime game, pull OU 2.5 (over) from matches_ot.odds
+    and inject it into our odds dict. Returns updated odds (non-destructive).
+    """
+    try:
+        link = supabase.table("ot_links").select("game_id").eq("game_id", None).execute()  # noop to ensure client live
+    except Exception:
+        # supabase client available but the above trick could fail silently; continue
+        pass
+
+    try:
+        link = supabase.table("ot_links").select("game_id").eq("fixture_id", fixture_id).execute()
+        rows = getattr(link, "data", None)
+        if not rows:
+            return odds
+        game_id = rows[0].get("game_id")
+        if not game_id:
+            return odds
+
+        ot = supabase.table("matches_ot").select("odds, bet_url").eq("game_id", game_id).execute()
+        ot_rows = getattr(ot, "data", None)
+        if not ot_rows:
+            return odds
+
+        ot_odds = ot_rows[0].get("odds") or {}
+        ou25 = (ot_odds.get("ou_2_5") or {}).get("over")
+        if ou25:
+            new_odds = dict(odds or {})
+            new_odds["over_2_5"] = float(ou25)
+            logger.info("🔄 Enriched Over 2.5 from Overtime for fixture %s: %.3f", fixture_id, float(ou25))
+            return new_odds
+        return odds
+    except Exception as e:
+        logger.warning("⚠️ Overtime enrich failed for fixture %s: %s", fixture_id, e)
+        return odds
+
 # ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
@@ -124,20 +166,29 @@ def main():
     try:
         # quick sanity that Render env is wired
         supa_url_present = bool(os.getenv("SUPABASE_URL"))
-        supa_key_present = bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
-        ot_key_present   = bool(os.getenv("OVERTIME_API_KEY"))
+        supa_key_present = bool(
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+        )
+        ot_key_present = bool(os.getenv("OVERTIME_API_KEY"))
         logger.info(
-            "🚀 Starting system… (writer_with_reasons=%s, overtime_module=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
+            "🚀 Starting system… (writer_with_reasons=%s, overtime=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
             _HAS_REASONED_WRITER, _HAS_OVERTIME, supa_url_present, supa_key_present, ot_key_present
         )
 
-        # 0) Ingest ALL open Overtime soccer games into matches_ot (no linking yet)
+        # 0) Ingest ALL open Overtime soccer games into matches_ot (idempotent)
         if _HAS_OVERTIME:
             try:
                 games, written = ingest_all_overtime_soccer()
-                logger.info("🧲 Overtime ingest complete: games=%s, rows_written=%s", games, written)
+                logger.info("🧲 Overtime ingest: games=%s, rows_written=%s", games, written)
             except Exception as e:
                 logger.warning("⚠️ Overtime ingest failed: %s", e)
+
+            # Link ONLY games already in matches_ot → fixtures (DB-based)
+            try:
+                g, linked, skipped = link_overtime_to_fixtures_from_db(window_days=2)
+                logger.info("🔗 Overtime linking (DB): games=%s, linked=%s, skipped=%s", g, linked, skipped)
+            except Exception as e:
+                logger.warning("⚠️ Overtime linking failed: %s", e)
 
         # 1) Update results first
         update_results_for_finished_matches()
@@ -227,6 +278,9 @@ def main():
                 odds = get_match_odds(fixture_id) or {}
                 h2h = get_head_to_head(home["id"], away["id"]) or []
 
+                # Try to enrich OU2.5 using Overtime link (if present)
+                odds = _try_enrich_over25_with_overtime(fixture_id, odds)
+
                 match_json = {
                     "fixture_id": fixture_id,
                     "date": base["date"],            # ISO string UTC
@@ -247,12 +301,12 @@ def main():
                     except Exception as e:
                         logger.error(f"❌ Error inserting match {fixture_id}: {e}")
 
-                # Only predict if Over 2.5 odds exist (save tokens)
+                # Only predict if Over 2.5 odds exist (legacy or enriched)
                 if not _has_over25_price(match_json["odds"]):
                     logger.info(f"🪙 Skipping GPT for {fixture_id}: no usable Over 2.5 odds.")
                     continue
 
-                # Prediction (returns only over_2_5 market in our latest utils)
+                # Prediction (our get_prediction returns only over_2_5 market)
                 logger.info(f"🤖 Getting prediction for fixture {fixture_id}")
                 prediction = get_prediction(match_json)
                 if not prediction:
@@ -266,7 +320,6 @@ def main():
                     written, reason = write_value_prediction_with_reasons(int(fixture_id), "over_2_5", block)
                     logger.info("✍️ value_predictions wrote: %s (reason=%s) for fixture %s", written, reason, fixture_id)
                 else:
-                    # legacy path if you didn't add db_write.py
                     try:
                         wrote = _legacy_insert_value_predictions(prediction)
                         why = "LEGACY_PATH"
