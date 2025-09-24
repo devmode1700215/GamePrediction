@@ -42,47 +42,39 @@ if SUPABASE_KEY:
         "Prefer": "resolution=merge-duplicates,return=representation",
     })
 # ─────────────────────────────────────────────────────────────────────────────
-# LINKER: Overtime games → your fixtures (writes to public.ot_links)
+# DB-BASED LINKER: link only games already in matches_ot → your fixtures
 # ─────────────────────────────────────────────────────────────────────────────
 import unicodedata
 from difflib import SequenceMatcher
 
-# Read tuning from env (already defined earlier or add here)
-OVERTIME_MATCH_WINDOW_MIN = int(os.getenv("OVERTIME_MATCH_WINDOW_MIN", "480"))   # ±8h
-OVERTIME_MATCH_MIN_RATIO  = float(os.getenv("OVERTIME_MATCH_MIN_RATIO", "0.76"))
-OVERTIME_DEBUG_TOPK       = int(os.getenv("OVERTIME_DEBUG_TOPK", "3"))
+# Tunables (env)
+OVERTIME_MATCH_WINDOW_MIN = int(os.getenv("OVERTIME_MATCH_WINDOW_MIN", "1440"))   # ±24h default
+OVERTIME_MATCH_MIN_RATIO  = float(os.getenv("OVERTIME_MATCH_MIN_RATIO", "0.70"))  # relaxed
+OVERTIME_DEBUG_TOPK       = int(os.getenv("OVERTIME_DEBUG_TOPK", "5"))
 
-# Small REST client for links (reuse _sb headers)
-def _sb_upsert_link(game_id: str, fixture_id: int, confidence: float, matched_by: str = "auto") -> tuple[int, str]:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return 0, "NO_SUPABASE"
-    url = f"{SUPABASE_URL}/rest/v1/ot_links?on_conflict=game_id"
-    payload = {
-        "game_id": game_id,
-        "fixture_id": int(fixture_id),
-        "confidence": float(confidence),
-        "matched_by": matched_by,
-    }
-    r = _sb.post(url, data=json.dumps(payload))
-    if r.status_code < 400:
-        return 1, "OK"
-    # manual upsert if unique constraint missing (unlikely here, PK on game_id)
-    if "no unique or exclusion constraint" in (r.text or "").lower():
-        _sb.delete(f"{SUPABASE_URL}/rest/v1/ot_links?game_id=eq.{game_id}",
-                   headers={"Prefer": "return=minimal"})
-        ins = _sb.post(f"{SUPABASE_URL}/rest/v1/ot_links", data=json.dumps(payload))
-        return (1, "MANUAL_UPSERT_OK") if ins.status_code < 400 else (0, f"INSERT_FAIL:{ins.text}")
-    return 0, f"HTTP_{r.status_code}:{r.text}"
-
-# Normalization helpers
-_STOP = {"fc","cf","sc","ac","afc","cfc","club","ii","b","women","ladies","the"}
-_ABBR = {"utd":"united","st":"saint","st.":"saint","intl":"international","int'l":"international","dep":"deportivo","&":"and"}
+# Team text normalization
+_STOP = {
+    "fc","cf","sc","ac","afc","cfc","club","ii","b","u19","u20","u21","u23",
+    "women","ladies","the"
+}
+_ABBR = {
+    "utd":"united","st":"saint","st.":"saint","intl":"international","int'l":"international",
+    "dep":"deportivo","ath":"athletic","&":"and"
+}
+# Optional hard aliases for pesky cases (extend as needed)
+_ALIASES = {
+    "riga fc":"riga",
+    "man utd":"manchester united",
+    "psg":"paris saint germain",
+}
 
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 def _tokens(name: str) -> list[str]:
     s = _strip_accents((name or "").lower())
+    # apply hard alias first
+    s = _ALIASES.get(s, s)
     s = re.sub(r"[^\w\s]", " ", s)
     toks = []
     for t in s.split():
@@ -110,8 +102,13 @@ def _minutes_diff(a_iso: str, b_iso: str) -> float | None:
     except Exception:
         return None
 
+def _teams_basic_overlap(a: str, b: str) -> bool:
+    """Accept if at least one significant token overlaps (helps 'Riga' vs 'Riga FC')."""
+    ta, tb = set(_tokens(a)), set(_tokens(b))
+    return bool(ta and tb and (ta & tb))
+
 def _best_fixture_match(ot_game: dict, fixtures: list[dict]) -> tuple[dict | None, float, float | None, list]:
-    """Return (best_fixture, score, minutes_diff, debug_candidates[])"""
+    """Return (best_fixture, score, minutes_diff, topk_debug[])"""
     mh, ma = ot_game.get("homeTeam",""), ot_game.get("awayTeam","")
     mdt    = ot_game.get("maturityDate","")
     scored = []
@@ -121,16 +118,27 @@ def _best_fixture_match(ot_game: dict, fixtures: list[dict]) -> tuple[dict | Non
         h, a = (tms.get("home") or {}).get("name",""), (tms.get("away") or {}).get("name","")
         if not h or not a or not fx.get("date"):
             continue
+
+        # fuzzy both directions (swap tolerant)
         r1 = _token_set_ratio(mh, h) * _token_set_ratio(ma, a)
-        r2 = _token_set_ratio(mh, a) * _token_set_ratio(ma, h)  # swapped
+        r2 = _token_set_ratio(mh, a) * _token_set_ratio(ma, h)
         name_score = max(r1, r2)  # 0..1
+
+        # subset/overlap rescue for short names
+        rescue_ok = (
+            (_teams_basic_overlap(mh, h) and _teams_basic_overlap(ma, a)) or
+            (_teams_basic_overlap(mh, a) and _teams_basic_overlap(ma, h))
+        )
+        if rescue_ok and name_score < 0.6:
+            name_score = max(name_score, 0.6)  # bump to acceptable baseline
 
         mdiff = _minutes_diff(mdt, fx["date"])
         time_score = 0.0
         if mdiff is not None:
             time_score = max(0.0, 1.0 - (mdiff / max(1.0, OVERTIME_MATCH_WINDOW_MIN)))
 
-        score = 0.75*name_score + 0.25*time_score
+        # prefer 3-way siblings later when we build odds; scoring sticks to names+time
+        score = 0.8*name_score + 0.2*time_score
         scored.append((score, f, name_score, mdiff))
 
     if not scored:
@@ -150,57 +158,112 @@ def _best_fixture_match(ot_game: dict, fixtures: list[dict]) -> tuple[dict | Non
     } for s, fx, ns, md in scored[:OVERTIME_DEBUG_TOPK]]
     return best_fx, best_score, best_mins, topk
 
-def link_overtime_to_fixtures(window_days: int = 2) -> tuple[int, int, int]:
+def _sb_list_matches_ot(since_iso: str, until_iso: str, page_size: int = 1000) -> list[dict]:
+    """Read matches_ot rows from Supabase within a maturity window."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+    rows, offset = [], 0
+    while True:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/{OT_TABLE}"
+            f"?select=game_id,home_team,away_team,maturity,network_id"
+            f"&maturity=gte.{since_iso}&maturity=lte.{until_iso}"
+            f"&order=maturity.asc&limit={page_size}&offset={offset}"
+        )
+        r = _sb.get(url, timeout=30)
+        r.raise_for_status()
+        batch = r.json() if r.text else []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return rows
+
+def _sb_upsert_link(game_id: str, fixture_id: int, confidence: float, matched_by: str = "auto") -> tuple[int, str]:
+    """Upsert one link row into public.ot_links."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0, "NO_SUPABASE"
+    url = f"{SUPABASE_URL}/rest/v1/ot_links?on_conflict=game_id"
+    payload = {
+        "game_id": str(game_id),
+        "fixture_id": int(fixture_id),
+        "confidence": float(confidence),
+        "matched_by": matched_by,
+    }
+    r = _sb.post(url, data=json.dumps(payload))
+    if r.status_code < 400:
+        return 1, "OK"
+    # manual upsert fallback
+    if "no unique or exclusion constraint" in (r.text or "").lower():
+        _sb.delete(f"{SUPABASE_URL}/rest/v1/ot_links?game_id=eq.{game_id}",
+                   headers={"Prefer": "return=minimal"})
+        ins = _sb.post(f"{SUPABASE_URL}/rest/v1/ot_links", data=json.dumps(payload))
+        return (1, "MANUAL_UPSERT_OK") if ins.status_code < 400 else (0, f"INSERT_FAIL:{ins.text}")
+    return 0, f"HTTP_{r.status_code}:{r.text}"
+
+def link_overtime_to_fixtures_from_db(window_days: int = 2) -> tuple[int, int, int]:
     """
-    1) Fetch all open Overtime soccer games (already in memory via _overtime_get_markets()).
-    2) Fetch your fixtures for today..today+window_days.
-    3) Fuzzy+time match → upsert ot_links (game_id ↔ fixture_id).
+    Link ONLY games already present in matches_ot to your fixtures.
+    Steps:
+      1) read OT games from DB for [now-12h .. now+window_days+1d] (UTC),
+      2) fetch your fixtures for [today .. today+window_days],
+      3) fuzzy+time match,
+      4) upsert into public.ot_links.
     Returns: (games_seen, linked_count, skipped_count)
     """
-    # 1) Overtime games
-    markets = _overtime_get_markets()
-    by_gid: dict[str, dict] = {}
-    for m in markets:
-        gid = str(m.get("gameId"))
-        if gid and gid not in by_gid:
-            by_gid[gid] = m  # one representative per game
+    # time window (UTC)
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(hours=12)).isoformat()
+    until = (now + timedelta(days=window_days+1)).isoformat()
+
+    # 1) OT games from DB
+    try:
+        ot_games = _sb_list_matches_ot(since, until)
+    except Exception as e:
+        log.error("Reading matches_ot failed: %s", e)
+        return 0, 0, 0
 
     # 2) Your fixtures (next N days)
     from utils.get_football_data import fetch_fixtures  # local import to avoid cycles
-    now = datetime.now(timezone.utc)
-    days = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(window_days+1)]
     fixtures: list[dict] = []
-    for d in days:
+    for i in range(window_days + 1):
+        d = (now + timedelta(days=i)).strftime("%Y-%m-%d")
         try:
-            arr = fetch_fixtures(d) or []
-            fixtures.extend(arr)
+            fixtures.extend(fetch_fixtures(d) or [])
         except Exception as e:
             log.warning("fetch_fixtures(%s) failed: %s", d, e)
 
-    linked = 0
-    skipped = 0
-    for gid, game in by_gid.items():
+    linked = skipped = 0
+    for g in ot_games:
+        game = {
+            "gameId": g.get("game_id"),
+            "homeTeam": g.get("home_team"),
+            "awayTeam": g.get("away_team"),
+            "maturityDate": g.get("maturity"),
+        }
         best_fx, score, mdiff, topk = _best_fixture_match(game, fixtures)
-        if OVERTIME_DEBUG_TOPK and topk:
-            log.info("OT match candidates for %s: %s", gid, json.dumps(topk, ensure_ascii=False))
 
-        # accept if score & time within window
-        minutes_ok = (mdiff is not None and mdiff <= OVERTIME_MATCH_WINDOW_MIN)
-        if score >= OVERTIME_MATCH_MIN_RATIO and minutes_ok and best_fx:
-            fixture_id = (best_fx.get("fixture") or {}).get("id")
-            if fixture_id:
-                w, reason = _sb_upsert_link(gid, int(fixture_id), float(score), matched_by="auto")
-                if w > 0:
-                    linked += 1
-                else:
-                    log.warning("Link upsert failed for gid=%s → fixture=%s: %s", gid, fixture_id, reason)
-            else:
-                skipped += 1
-        else:
+        if score < OVERTIME_MATCH_MIN_RATIO or (mdiff is None or mdiff > OVERTIME_MATCH_WINDOW_MIN):
+            if OVERTIME_DEBUG_TOPK and topk:
+                log.info("LINK SKIP gid=%s score=%.3f mdiff=%s topk=%s",
+                         g.get("game_id"), score, mdiff, json.dumps(topk, ensure_ascii=False))
             skipped += 1
+            continue
 
-    log.info("Linking summary: games=%s, linked=%s, skipped=%s", len(by_gid), linked, skipped)
-    return len(by_gid), linked, skipped
+        fixture_id = (best_fx.get("fixture") or {}).get("id")
+        if not fixture_id:
+            skipped += 1
+            continue
+
+        w, reason = _sb_upsert_link(str(g.get("game_id")), int(fixture_id), float(score), matched_by="auto")
+        if w > 0:
+            linked += 1
+        else:
+            log.warning("Link upsert failed gid=%s→fixture=%s: %s", g.get("game_id"), fixture_id, reason)
+
+    log.info("Link(DB) summary: games=%s, linked=%s, skipped=%s", len(ot_games), linked, skipped)
+    return len(ot_games), linked, skipped
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _safe_float(x) -> Optional[float]:
