@@ -1,0 +1,130 @@
+# api_server.py
+import os, json, time
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, UUID4
+
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+OVERTIME_API_KEY = os.getenv("OVERTIME_API_KEY")
+OT_NETWORK_ID = os.getenv("OT_NETWORK_ID", "8453")  # set to your Base network code per Overtime docs
+BETTING_ENABLED = os.getenv("BETTING_ENABLED", "true").lower() == "true"
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_*KEY")
+if not OVERTIME_API_KEY:
+    print("⚠️ Missing OVERTIME_API_KEY: /overtime/quote will fail until you set it.")
+
+app = FastAPI(title="GamePrediction API", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
+
+def _sb(path: str, method="GET", json_body=None, params=None):
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    url = f"{SUPABASE_URL}{path}"
+    r = requests.request(method, url, headers=headers, json=json_body, params=params, timeout=30)
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text)
+    return r.json() if r.text else None
+
+class QuoteIn(BaseModel):
+    prediction_id: UUID4
+    stake: float
+
+@app.get("/bettable")
+def bettable(limit: int = 200):
+    # If you created a materialized view, change to bettable_predictions_mv
+    data = _sb(f"/rest/v1/bettable_predictions_v", params={"select": "*", "limit": str(limit)})
+    return data or []
+
+@app.post("/overtime/quote")
+def overtime_quote(body: QuoteIn):
+    if not BETTING_ENABLED:
+        raise HTTPException(503, "Betting disabled")
+
+    # 1) Load the bettable row by prediction_id
+    rows = _sb("/rest/v1/bettable_predictions_v", params={
+        "select": "*", "prediction_id": f"eq.{body.prediction_id}"
+    })
+    if not rows:
+        raise HTTPException(404, "Prediction not bettable (filters failed or expired).")
+    row = rows[0]
+
+    # 2) Pull the OT trade payload saved in matches_ot (we stored these when ingesting Overtime)
+    game_id = row["game_id"]
+    mot = _sb("/rest/v1/matches_ot", params={"select": "trade_ou_2_5,trade_btts,odds,network_id", "game_id": f"eq.{game_id}"})
+    if not mot:
+        raise HTTPException(404, "Overtime game not found in matches_ot.")
+    mot = mot[0]
+
+    market = row["market"]           # 'over_2_5' or 'btts'
+    side = row["prediction"]         # 'Over' or 'Yes' (we only expose value sides)
+    trade_payload = None
+
+    if market == "over_2_5":
+        trade_payload = mot.get("trade_ou_2_5")
+        if not trade_payload:
+            raise HTTPException(422, "Missing trade_ou_2_5 payload in matches_ot.")
+        # Optionally set the side inside the trade payload if your schema requires it.
+    elif market == "btts":
+        trade_payload = mot.get("trade_btts")
+        if not trade_payload:
+            raise HTTPException(422, "Missing trade_btts payload in matches_ot.")
+    else:
+        raise HTTPException(400, f"Unsupported market {market}")
+
+    # 3) Build Quote API request (shape must match Overtime V2 docs for your account)
+    # Keep it minimal and pass-through your stored ticket; include stake.
+    if not OVERTIME_API_KEY:
+        raise HTTPException(500, "Missing OVERTIME_API_KEY on server")
+
+    headers = {
+        "x-api-key": OVERTIME_API_KEY,
+        "content-type": "application/json",
+    }
+    quote_url = f"https://api.overtime.io/overtime-v2/networks/{OT_NETWORK_ID}/quote"
+
+    payload = {
+        # Adjust keys to match the Overtime Quote API schema you were given.
+        # The common pattern is a "ticket" (array of one or multiple markets) plus an amount.
+        "ticket": [trade_payload],
+        "amount": body.stake
+    }
+
+    r = requests.post(quote_url, headers=headers, data=json.dumps(payload), timeout=30)
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
+
+class BetIn(BaseModel):
+    prediction_id: UUID4
+    wallet: str
+    game_id: str
+    fixture_id: Optional[int] = None
+    market: str
+    side: str
+    stake: float
+    expected_odds: Optional[float] = None
+    quote: Optional[float] = None
+    tx_hash: Optional[str] = None
+    network_id: int = int(os.getenv("OT_NETWORK_ID", "8453"))
+
+@app.post("/bets")
+def record_bet(b: BetIn):
+    # store one row (idempotent on tx_hash)
+    row = b.dict()
+    row["created_at"] = row["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        if b.tx_hash:
+            # upsert on tx_hash if provided
+            res = _sb("/rest/v1/bets?on_conflict=tx_hash", method="POST", json_body=row)
+        else:
+            res = _sb("/rest/v1/bets", method="POST", json_body=row)
+        return {"ok": True, "inserted": res}
+    except HTTPException as e:
+        raise
