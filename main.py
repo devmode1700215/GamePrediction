@@ -1,7 +1,6 @@
 # main.py
 # -*- coding: utf-8 -*-
 
-import json
 import logging
 import os
 import sys
@@ -9,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
+# --- Local utils -------------------------------------------------------------
 from utils.get_prediction import get_prediction
 from utils.fetch_and_store_result import fetch_and_store_result
 from utils.get_football_data import (
@@ -24,7 +24,7 @@ from utils.insert_match import insert_match
 from utils.get_matches_needing_results import get_matches_needing_results
 from utils.supabaseClient import supabase
 
-# Prefer the reasoned writer (hard-gates odds/conf/edge) if available
+# Prefer the strict writer if available (odds/conf/edge gates & detailed reasons)
 try:
     from utils.db_write import write_value_prediction as write_value_prediction_with_reasons
     _HAS_REASONED_WRITER = True
@@ -32,19 +32,19 @@ except Exception:
     from utils.insert_value_predictions import insert_value_predictions as _legacy_insert_value_predictions
     _HAS_REASONED_WRITER = False
 
-# Overtime helpers (ingest + DB-based linker)
+# Overtime: ingest + SQL linker RPC (safe fallbacks)
 try:
     from utils.overtime_integration import (
         ingest_all_overtime_soccer,
-        link_overtime_to_fixtures_from_db,
+        run_sql_linker,
     )
     _HAS_OVERTIME = True
 except Exception:
     _HAS_OVERTIME = False
     def ingest_all_overtime_soccer():
         return 0, 0
-    def link_overtime_to_fixtures_from_db(window_days: int = 7):
-        return 0, 0, 0
+    def run_sql_linker(minutes_window: int = 72 * 60, min_ratio: float = 0.58):
+        return 0, 0
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -86,7 +86,7 @@ def safe_extract_match_data(match):
 
         return {
             "fixture_id": fixture_id,
-            "date": date,  # ISO8601 string UTC
+            "date": date,  # ISO8601 (UTC)
             "league": {
                 "name": league.get("name", "Unknown"),
                 "country": league.get("country", "Unknown"),
@@ -157,11 +157,8 @@ def _try_enrich_over25_with_overtime(fixture_id: int, odds: dict) -> dict:
             return odds
 
         v = float(ou25)
-        if v < ODDS_MIN or v > ODDS_MAX:
-            logger.info(
-                "↩️ Ignoring Overtime OU2.5 %.3f (out of [%s,%s]) for fixture %s",
-                v, ODDS_MIN, ODDS_MAX, fixture_id
-            )
+        if not (ODDS_MIN <= v <= ODDS_MAX):
+            logger.info("↩️ Ignoring Overtime OU2.5 %.3f (out of [%s,%s]) for fixture %s", v, ODDS_MIN, ODDS_MAX, fixture_id)
             return odds
 
         new_odds = dict(odds or {})
@@ -177,40 +174,37 @@ def _try_enrich_over25_with_overtime(fixture_id: int, odds: dict) -> dict:
 # ------------------------------------------------------------------------------
 def main():
     try:
-        # quick sanity that Render env is wired
+        # Quick env sanity
         supa_url_present = bool(os.getenv("SUPABASE_URL"))
-        supa_key_present = bool(
-            os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-        )
+        supa_key_present = bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
         ot_key_present = bool(os.getenv("OVERTIME_API_KEY"))
         logger.info(
-            "🚀 Starting system… (reasoned_writer=%s, overtime=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
+            "🚀 Start (reasoned_writer=%s, overtime=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
             _HAS_REASONED_WRITER, _HAS_OVERTIME, supa_url_present, supa_key_present, ot_key_present
         )
 
-        # 0) Ingest Overtime games then LINK THEM (👉 this is the new linker call)
+        # 0) Overtime ingest (optional) + SQL linker (next 2 days)
         if _HAS_OVERTIME:
             try:
-                games, written = ingest_all_overtime_soccer()
-                logger.info("🧲 Overtime ingest: games=%s, rows_written=%s", games, written)
+                games, wrote = ingest_all_overtime_soccer()
+                logger.info("🧲 Overtime ingest: games=%s, rows_written=%s", games, wrote)
             except Exception as e:
                 logger.warning("⚠️ Overtime ingest failed: %s", e)
 
-            # 👉 DB-based linker: matches_ot → fixtures (today..+7d by default)
             try:
-                g, linked, skipped = link_overtime_to_fixtures_from_db()
-                logger.info("🔗 Overtime linking (DB): games=%s, linked=%s, skipped=%s", g, linked, skipped)
+                upd, lnk = run_sql_linker(minutes_window=72 * 60, min_ratio=0.58)
+                logger.info("🔗 SQL linker (next 2d): matches_ot updated=%s, ot_links upserted=%s", upd, lnk)
             except Exception as e:
-                logger.warning("⚠️ Overtime linking failed: %s", e)
+                logger.warning("⚠️ SQL auto-linker failed: %s", e)
 
         # 1) Update results first
         update_results_for_finished_matches()
 
-        # 2) Build a 48h window (UTC, timezone-aware)
+        # 2) Window = next 48h (only)
         now = datetime.now(timezone.utc)
         d0 = now.strftime("%Y-%m-%d")
         d1 = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-        d2 = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+        d2 = (now + timedelta(days=2)).strftime("%Y-%m-%d")  # fetch day+2, then filter strictly by timestamp
 
         logger.info(f"📅 Fetching fixtures for {d0}, {d1}, {d2}")
 
@@ -224,12 +218,11 @@ def main():
             if isinstance(day, list):
                 fixtures.extend(day)
 
-        # Filter fixtures to the next 48h by timestamp (if available)
+        # Filter to the next 48h by timestamp
         horizon = now + timedelta(hours=48)
         try:
             fixtures = [
-                f
-                for f in fixtures
+                f for f in fixtures
                 if f.get("fixture", {}).get("timestamp")
                 and now.timestamp() <= f["fixture"]["timestamp"] <= horizon.timestamp()
             ]
@@ -251,7 +244,7 @@ def main():
 
                 fixture_id = base["fixture_id"]
 
-                # Avoid duplicate 'matches' rows; still allow predictions
+                # Already have a 'matches' row?
                 try:
                     already = supabase.table("matches").select("fixture_id").eq("fixture_id", fixture_id).execute()
                     exists = bool(getattr(already, "data", None))
@@ -269,28 +262,26 @@ def main():
                 home = dict(base["home_team"])
                 away = dict(base["away_team"])
 
-                # First, pull odds (legacy) and try to enrich OU2.5 from Overtime via link
+                # Odds first (cheap), then try enrich OU2.5 from Overtime via link
                 odds = get_match_odds(fixture_id) or {}
                 odds = _try_enrich_over25_with_overtime(fixture_id, odds)
 
                 # Gate early: only proceed if OU 2.5 exists and is within [ODDS_MIN, ODDS_MAX]
                 if not _has_ou25_in_range(odds):
-                    logger.info(
-                        f"🪙 Skipping GPT for {fixture_id}: Over 2.5 odds not in range [{ODDS_MIN},{ODDS_MAX}]."
-                    )
-                    # still insert match (if missing) so we have record/odds snapshot
-                    match_json_min = {
-                        "fixture_id": fixture_id,
-                        "date": base["date"],
-                        "league": base["league"],
-                        "venue": base["venue"],
-                        "home_team": home,
-                        "away_team": away,
-                        "odds": odds,
-                        "head_to_head": [],
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    }
+                    logger.info(f"🪙 Skipping GPT for {fixture_id}: Over 2.5 odds not in range [{ODDS_MIN},{ODDS_MAX}].")
+                    # still insert minimal match row (odds snapshot) if we don't have it
                     if not exists:
+                        match_json_min = {
+                            "fixture_id": fixture_id,
+                            "date": base["date"],
+                            "league": base["league"],
+                            "venue": base["venue"],
+                            "home_team": home,
+                            "away_team": away,
+                            "odds": odds,
+                            "head_to_head": [],
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                        }
                         try:
                             insert_match(match_json_min)
                             logger.info(f"✅ Inserted match {fixture_id} (odds-only)")
@@ -298,7 +289,7 @@ def main():
                             logger.error(f"❌ Error inserting match {fixture_id}: {e}")
                     continue
 
-                # Only now fetch heavy team data
+                # Heavy data AFTER we know odds are in range
                 home["position"] = get_team_position(home["id"], league_id, season)
                 away["position"] = get_team_position(away["id"], league_id, season)
 
@@ -317,7 +308,7 @@ def main():
 
                 match_json = {
                     "fixture_id": fixture_id,
-                    "date": base["date"],            # ISO string UTC
+                    "date": base["date"],
                     "league": base["league"],
                     "venue": base["venue"],
                     "home_team": home,
@@ -335,7 +326,7 @@ def main():
                     except Exception as e:
                         logger.error(f"❌ Error inserting match {fixture_id}: {e}")
 
-                # Prediction (get_prediction returns only over_2_5 market)
+                # Prediction (get_prediction returns only over_2_5 block)
                 logger.info(f"🤖 Getting prediction for fixture {fixture_id}")
                 prediction = get_prediction(match_json)
                 if not prediction:
@@ -347,21 +338,15 @@ def main():
 
                 if _HAS_REASONED_WRITER:
                     written, reason = write_value_prediction_with_reasons(int(fixture_id), "over_2_5", block)
-                    logger.info(
-                        "✍️ value_predictions wrote: %s (reason=%s) for fixture %s",
-                        written, reason, fixture_id
-                    )
+                    logger.info("✍️ value_predictions wrote: %s (reason=%s) for fixture %s", written, reason, fixture_id)
                 else:
                     try:
                         wrote = _legacy_insert_value_predictions(prediction)
-                        why = "LEGACY_PATH"
+                        reason = "LEGACY_PATH"
                     except Exception as e:
                         wrote = 0
-                        why = f"LEGACY_EXCEPTION:{e}"
-                    logger.info(
-                        "✍️ value_predictions wrote: %s (reason=%s) for fixture %s",
-                        wrote, why, fixture_id
-                    )
+                        reason = f"LEGACY_EXCEPTION:{e}"
+                    logger.info("✍️ value_predictions wrote: %s (reason=%s) for fixture %s", wrote, reason, fixture_id)
 
                 successful += 1
 
