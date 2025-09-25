@@ -279,6 +279,35 @@ def _sb_upsert_matches_ot(row: Dict[str, Any]) -> Tuple[int, str]:
         return 0, f"INSERT_FAIL:{ins.text}"
     return 0, f"HTTP_{r.status_code}:{r.text}"
 
+# utils/overtime_integration.py (append)
+import json, requests, os, logging
+log = logging.getLogger(__name__)
+
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+
+def run_sql_linker(minutes_window: int = 72*60, min_ratio: float = 0.58):
+    """Calls the SQL linker function via PostgREST RPC."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_*KEY")
+
+    url = f"{SUPABASE_URL}/rest/v1/rpc/link_ot_to_matches_next_2d"
+    payload = {"p_minutes_window": int(minutes_window), "p_min_ratio": float(min_ratio)}
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"RPC failed {r.status_code}: {r.text}")
+    data = r.json() or [{}]
+    upd = data[0].get("updated_matches_ot", 0)
+    lnk = data[0].get("upserted_links", 0)
+    log.info("🔁 SQL linker: updated_matches_ot=%s, upserted_links=%s", upd, lnk)
+    return upd, lnk
+
+
 # ── PUBLIC 1: Ingest ALL open Soccer games into matches_ot ───────────────────
 def ingest_all_overtime_soccer() -> Tuple[int, int]:
     """
