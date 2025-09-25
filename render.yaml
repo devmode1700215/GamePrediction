@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: gameprediction-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OVERTIME_API_KEY
+        sync: false
+      - key: OT_NETWORK_ID
+        value: "8453"        # or your value from Overtime; keep as env so you can change later
+      - key: BETTING_ENABLED
+        value: "true"
+
+  - type: worker
+    name: gameprediction-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OVERTIME_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: BETTING_ENABLED
+        value: "false"
