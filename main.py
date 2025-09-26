@@ -137,24 +137,22 @@ def _select_over25_odds(fixture_id: int, matches_odds: dict):
             supabase.table("ot_links")
             .select("game_id")
             .eq("fixture_id", fixture_id)
-            .single()
             .execute()
         )
-        game_id = (link_q.data or {}).get("game_id")
+        game_id = (link_q.data or [{}])[0].get("game_id") if (link_q.data) else None
         if game_id:
             mot_q = (
                 supabase.table("matches_ot")
                 .select("odds")
                 .eq("game_id", game_id)
-                .single()
                 .execute()
             )
-            ot_odds = (mot_q.data or {}).get("odds")
+            ot_odds = (mot_q.data or [{}])[0].get("odds")
             over = _read_over25_from_ot_odds(ot_odds)
             if over is not None:
                 return over, "overtime"
     except Exception:
-        # we keep it quiet; fall back gracefully
+        # fall through
         pass
 
     # 2) Fall back to matches.odds
@@ -163,53 +161,42 @@ def _select_over25_odds(fixture_id: int, matches_odds: dict):
         return over, "apifootball"
 
     return None, "none"
-    
+
+
 def _normalize_prediction_shape(pred: dict) -> dict:
     """Force a stable shape for insert_value_predictions."""
     if not isinstance(pred, dict):
         return {}
-
     out = dict(pred)  # shallow copy
 
-    # 1) Market: default to OU 2.5 (your current pipeline)
+    # Market mapping / default to OU 2.5 for current pipeline
     m = (out.get("market") or out.get("market_name") or out.get("marketType") or "").lower().strip()
     if m in ("ou_2_5", "ou25", "over25", "o/u 2.5", "o/u2.5", "over_2_5"):
         m = "over_2_5"
-    if m in ("btts", "both_to_score", "both_teams_to_score", "gg", "yes/no"):
+    elif m in ("btts", "both_to_score", "both_teams_to_score", "gg", "yes/no"):
         m = "btts"
     if not m:
-        m = "over_2_5"  # <— default for your current run
+        m = "over_2_5"
     out["market"] = m
 
-    # 2) Pick / side mapping to your canonical strings
+    # Pick mapping
     pick = out.get("prediction") or out.get("pick") or out.get("side")
     if isinstance(pick, str):
         p = pick.lower().strip()
         mapping = {"over": "Over", "under": "Under", "yes": "Yes", "no": "No"}
         out["prediction"] = mapping.get(p, out.get("prediction")) or ("Over" if m == "over_2_5" else None)
 
-    # 3) Numeric coercions
-    def _to_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
+    # Numeric coercions
+    for k in ("odds", "confidence_pct", "edge", "stake_pct"):
+        if k in out and not isinstance(out[k], (int, float)):
+            out[k] = _to_float(out[k])
 
-    if "odds" in out and not isinstance(out["odds"], (int, float)):
-        out["odds"] = _to_float(out["odds"])
-    if "confidence_pct" in out and not isinstance(out["confidence_pct"], (int, float)):
-        out["confidence_pct"] = _to_float(out["confidence_pct"])
-    if "edge" in out and not isinstance(out["edge"], (int, float)):
-        out["edge"] = _to_float(out["edge"])
-    if "stake_pct" in out and not isinstance(out["stake_pct"], (int, float)):
-        out["stake_pct"] = _to_float(out["stake_pct"])
-
-    # 4) Ensure booleans exist
+    # po_value default if missing
     if "po_value" not in out:
-        out["po_value"] = True if (out.get("edge") and out["edge"] > 0) else bool(out.get("po_value", False))
+        e = out.get("edge")
+        out["po_value"] = True if (e is not None and e > 0) else bool(out.get("po_value", False))
 
     return out
-
 
 # ───────────────────────── Main ─────────────────────────
 def main():
@@ -341,19 +328,27 @@ def main():
                 # Run prediction
                 logger.info(f"🤖 Getting prediction for fixture {fixture_id} (OU2.5={over_odds:.2f}, src={src})")
                 prediction = get_prediction(model_input)
-if not prediction:
-    logger.info(f"🟨 No prediction returned for fixture {fixture_id}")
-    failed += 1
-    continue
+                if not prediction:
+                    logger.info(f"🟨 No prediction returned for fixture {fixture_id}")
+                    failed += 1
+                    continue
 
-# 🔧 Normalize shape so market is always present (defaults to over_2_5)
-prediction = _normalize_prediction_shape(prediction)
+                # Normalize shape so market is always present (defaults to over_2_5)
+                prediction = _normalize_prediction_shape(prediction)
 
-wrote, reason = insert_value_predictions(prediction, odds_source=src)
-if wrote:
-    logger.info(f"🟢 value_predictions wrote: {wrote} for fixture {fixture_id}")
-else:
-    logger.info(f"✍️ value_predictions wrote: {wrote} (reason={reason}) for fixture {fixture_id}")
+                # Insert value predictions (handle both old and new return types)
+                res = insert_value_predictions(prediction, odds_source=src)
+                if isinstance(res, tuple):
+                    wrote, reason = res
+                else:
+                    wrote, reason = (int(res) if res else 0), ("OK" if res else "UNKNOWN")
+
+                if wrote:
+                    logger.info(f"🟢 value_predictions wrote: {wrote} for fixture {fixture_id}")
+                    successful += 1
+                else:
+                    logger.info(f"✍️ value_predictions wrote: {wrote} (reason={reason}) for fixture {fixture_id}")
+                    failed += 1
 
             except Exception as e:
                 logger.error(f"❌ Unexpected error processing fixture {match.get('fixture', {}).get('id')}: {e}")
