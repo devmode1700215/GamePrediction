@@ -1,15 +1,14 @@
 # main.py
-# -*- coding: utf-8 -*-
-
-import logging
 import os
+import logging
 import sys
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
-# --- Local utils -------------------------------------------------------------
 from utils.get_prediction import get_prediction
+from utils.insert_value_predictions import insert_value_predictions
 from utils.fetch_and_store_result import fetch_and_store_result
 from utils.get_football_data import (
     fetch_fixtures,
@@ -24,47 +23,25 @@ from utils.insert_match import insert_match
 from utils.get_matches_needing_results import get_matches_needing_results
 from utils.supabaseClient import supabase
 
-# Prefer the strict writer if available (odds/conf/edge gates & detailed reasons)
-try:
-    from utils.db_write import write_value_prediction as write_value_prediction_with_reasons
-    _HAS_REASONED_WRITER = True
-except Exception:
-    from utils.insert_value_predictions import insert_value_predictions as _legacy_insert_value_predictions
-    _HAS_REASONED_WRITER = False
-
-# Overtime: ingest + SQL linker RPC (safe fallbacks)
-try:
-    from utils.overtime_integration import (
-        ingest_all_overtime_soccer,
-        run_sql_linker,
-    )
-    _HAS_OVERTIME = True
-except Exception:
-    _HAS_OVERTIME = False
-    def ingest_all_overtime_soccer():
-        return 0, 0
-    def run_sql_linker(minutes_window: int = 72 * 60, min_ratio: float = 0.58):
-        return 0, 0
-
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
+# ───────────────────────── Logging & ENV ─────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# ------------------------------------------------------------------------------
-# Config / gates
-# ------------------------------------------------------------------------------
 ODDS_MIN = float(os.getenv("ODDS_MIN", "1.7"))
 ODDS_MAX = float(os.getenv("ODDS_MAX", "2.3"))
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
+# ───────────────────────── Helpers ─────────────────────────
+def _to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
 def safe_extract_match_data(match):
-    """Safely extract the minimal structure we need from the fixture payload."""
+    """Safely extract the minimal structure we need from the API fixture."""
     try:
         fixture = match.get("fixture", {})
         teams = match.get("teams", {})
@@ -86,7 +63,7 @@ def safe_extract_match_data(match):
 
         return {
             "fixture_id": fixture_id,
-            "date": date,  # ISO8601 (UTC)
+            "date": date,
             "league": {
                 "name": league.get("name", "Unknown"),
                 "country": league.get("country", "Unknown"),
@@ -103,7 +80,6 @@ def safe_extract_match_data(match):
 
 
 def update_results_for_finished_matches():
-    """Pull results for matches that need them and store into DB."""
     try:
         matches = get_matches_needing_results()
         if not matches:
@@ -117,94 +93,91 @@ def update_results_for_finished_matches():
         logger.error(f"❌ Error updating results: {e}")
 
 
-def _has_ou25_in_range(odds_dict, lo=ODDS_MIN, hi=ODDS_MAX):
-    """True if odds.over_2_5 exists and is within [lo, hi]."""
+def _read_over25_from_matches_odds(odds: dict):
+    """Accept both flat and nested shapes from matches.odds."""
+    if not isinstance(odds, dict):
+        return None
+    # flat: {"over_2_5": 1.85} or "1.85"
+    if "over_2_5" in odds:
+        v = odds["over_2_5"]
+        if isinstance(v, dict) and "over" in v:
+            return _to_float(v.get("over"))
+        return _to_float(v)
+    # sometimes inserted as {"ou_2_5": {"over": 1.85, "under": 1.95}}
+    if "ou_2_5" in odds and isinstance(odds["ou_2_5"], dict):
+        return _to_float(odds["ou_2_5"].get("over"))
+    return None
+
+
+def _read_over25_from_ot_odds(ot_odds: dict):
+    """
+    Overtime stores OU as {'ou_2_5': {'over': x, 'under': y}}.
+    Some feeds flatten as 'ou_2_5_over' or 'ou25_over'.
+    """
+    if not isinstance(ot_odds, dict):
+        return None
+    if "ou_2_5" in ot_odds and isinstance(ot_odds["ou_2_5"], dict):
+        return _to_float(ot_odds["ou_2_5"].get("over"))
+    for k in ("ou_2_5_over", "ou25_over"):
+        if k in ot_odds:
+            v = _to_float(ot_odds.get(k))
+            if v is not None:
+                return v
+    return None
+
+
+def _select_over25_odds(fixture_id: int, matches_odds: dict):
+    """
+    Prefer Overtime OU2.5 'over' when a link exists; otherwise use matches.odds.
+    Returns (odds_value or None, 'overtime'|'apifootball'|'none').
+    """
+    # 1) Try Overtime if linked
     try:
-        if not isinstance(odds_dict, dict):
-            return False
-        o = odds_dict.get("over_2_5")
-        if o is None:
-            return False
-        v = float(o)
-        return lo <= v <= hi
+        link_q = (
+            supabase.table("ot_links")
+            .select("game_id")
+            .eq("fixture_id", fixture_id)
+            .single()
+            .execute()
+        )
+        game_id = (link_q.data or {}).get("game_id")
+        if game_id:
+            mot_q = (
+                supabase.table("matches_ot")
+                .select("odds")
+                .eq("game_id", game_id)
+                .single()
+                .execute()
+            )
+            ot_odds = (mot_q.data or {}).get("odds")
+            over = _read_over25_from_ot_odds(ot_odds)
+            if over is not None:
+                return over, "overtime"
     except Exception:
-        return False
+        # we keep it quiet; fall back gracefully
+        pass
+
+    # 2) Fall back to matches.odds
+    over = _read_over25_from_matches_odds(matches_odds or {})
+    if over is not None:
+        return over, "apifootball"
+
+    return None, "none"
 
 
-def _try_enrich_over25_with_overtime(fixture_id: int, odds: dict) -> dict:
-    """
-    If fixture is linked to an Overtime game, pull OU 2.5 (over) from matches_ot.odds
-    and inject it into our odds dict when it's within [ODDS_MIN, ODDS_MAX].
-    """
-    try:
-        link = supabase.table("ot_links").select("game_id").eq("fixture_id", fixture_id).execute()
-        rows = getattr(link, "data", None)
-        if not rows:
-            return odds
-        game_id = rows[0].get("game_id")
-        if not game_id:
-            return odds
-
-        ot = supabase.table("matches_ot").select("odds, bet_url").eq("game_id", game_id).execute()
-        ot_rows = getattr(ot, "data", None)
-        if not ot_rows:
-            return odds
-
-        ot_odds = ot_rows[0].get("odds") or {}
-        ou25 = (ot_odds.get("ou_2_5") or {}).get("over")
-
-        if ou25 is None:
-            return odds
-
-        v = float(ou25)
-        if not (ODDS_MIN <= v <= ODDS_MAX):
-            logger.info("↩️ Ignoring Overtime OU2.5 %.3f (out of [%s,%s]) for fixture %s", v, ODDS_MIN, ODDS_MAX, fixture_id)
-            return odds
-
-        new_odds = dict(odds or {})
-        new_odds["over_2_5"] = v
-        logger.info("🔄 Enriched Over 2.5 from Overtime for fixture %s: %.3f", fixture_id, v)
-        return new_odds
-    except Exception as e:
-        logger.warning("⚠️ Overtime enrich failed for fixture %s: %s", fixture_id, e)
-        return odds
-
-# ------------------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------------------
+# ───────────────────────── Main ─────────────────────────
 def main():
     try:
-        # Quick env sanity
-        supa_url_present = bool(os.getenv("SUPABASE_URL"))
-        supa_key_present = bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY"))
-        ot_key_present = bool(os.getenv("OVERTIME_API_KEY"))
-        logger.info(
-            "🚀 Start (reasoned_writer=%s, overtime=%s, SUPABASE_URL=%s, SUPABASE_KEY=%s, OVERTIME_KEY=%s)",
-            _HAS_REASONED_WRITER, _HAS_OVERTIME, supa_url_present, supa_key_present, ot_key_present
-        )
-
-        # 0) Overtime ingest (optional) + SQL linker (next 2 days)
-        if _HAS_OVERTIME:
-            try:
-                games, wrote = ingest_all_overtime_soccer()
-                logger.info("🧲 Overtime ingest: games=%s, rows_written=%s", games, wrote)
-            except Exception as e:
-                logger.warning("⚠️ Overtime ingest failed: %s", e)
-
-            try:
-                upd, lnk = run_sql_linker(minutes_window=72 * 60, min_ratio=0.58)
-                logger.info("🔗 SQL linker (next 2d): matches_ot updated=%s, ot_links upserted=%s", upd, lnk)
-            except Exception as e:
-                logger.warning("⚠️ SQL auto-linker failed: %s", e)
+        logger.info("🚀 Starting football prediction system… Odds gate: [%s, %s]", ODDS_MIN, ODDS_MAX)
 
         # 1) Update results first
         update_results_for_finished_matches()
 
-        # 2) Window = next 48h (only)
+        # 2) Build a 48h window: today + tomorrow + day after
         now = datetime.now(timezone.utc)
         d0 = now.strftime("%Y-%m-%d")
         d1 = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-        d2 = (now + timedelta(days=2)).strftime("%Y-%m-%d")  # fetch day+2, then filter strictly by timestamp
+        d2 = (now + timedelta(days=2)).strftime("%Y-%m-%d")
 
         logger.info(f"📅 Fetching fixtures for {d0}, {d1}, {d2}")
 
@@ -218,11 +191,12 @@ def main():
             if isinstance(day, list):
                 fixtures.extend(day)
 
-        # Filter to the next 48h by timestamp
+        # Filter fixtures to the next 48h by timestamp (if available)
         horizon = now + timedelta(hours=48)
         try:
             fixtures = [
-                f for f in fixtures
+                f
+                for f in fixtures
                 if f.get("fixture", {}).get("timestamp")
                 and now.timestamp() <= f["fixture"]["timestamp"] <= horizon.timestamp()
             ]
@@ -230,7 +204,7 @@ def main():
             logger.error(f"❌ Error filtering fixtures by time window: {e}")
             fixtures = []
 
-        logger.info(f"🔍 Processing {len(fixtures)} fixtures...")
+        logger.info(f"🔍 Processing {len(fixtures)} fixtures…")
 
         successful = 0
         failed = 0
@@ -244,14 +218,11 @@ def main():
 
                 fixture_id = base["fixture_id"]
 
-                # Already have a 'matches' row?
-                try:
-                    already = supabase.table("matches").select("fixture_id").eq("fixture_id", fixture_id).execute()
-                    exists = bool(getattr(already, "data", None))
-                except Exception as e:
-                    logger.warning("⚠️ Could not check existing match %s: %s", fixture_id, e)
-                    exists = False
+                # Check if we already have a matches row; if yes, do not insert again
+                already = supabase.table("matches").select("fixture_id").eq("fixture_id", fixture_id).execute()
+                exists = bool(already.data)
 
+                # Gather extra team data we feed to GPT
                 season = base["season"]
                 league_id = base["league_id"]
                 if not season or not league_id:
@@ -259,95 +230,79 @@ def main():
                     failed += 1
                     continue
 
-                home = dict(base["home_team"])
-                away = dict(base["away_team"])
+                home = deepcopy(base["home_team"])
+                away = deepcopy(base["away_team"])
 
-                # Odds first (cheap), then try enrich OU2.5 from Overtime via link
-                odds = get_match_odds(fixture_id) or {}
-                odds = _try_enrich_over25_with_overtime(fixture_id, odds)
-
-                # Gate early: only proceed if OU 2.5 exists and is within [ODDS_MIN, ODDS_MAX]
-                if not _has_ou25_in_range(odds):
-                    logger.info(f"🪙 Skipping GPT for {fixture_id}: Over 2.5 odds not in range [{ODDS_MIN},{ODDS_MAX}].")
-                    # still insert minimal match row (odds snapshot) if we don't have it
-                    if not exists:
-                        match_json_min = {
-                            "fixture_id": fixture_id,
-                            "date": base["date"],
-                            "league": base["league"],
-                            "venue": base["venue"],
-                            "home_team": home,
-                            "away_team": away,
-                            "odds": odds,
-                            "head_to_head": [],
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                        try:
-                            insert_match(match_json_min)
-                            logger.info(f"✅ Inserted match {fixture_id} (odds-only)")
-                        except Exception as e:
-                            logger.error(f"❌ Error inserting match {fixture_id}: {e}")
-                    continue
-
-                # Heavy data AFTER we know odds are in range
+                # Team positions
                 home["position"] = get_team_position(home["id"], league_id, season)
                 away["position"] = get_team_position(away["id"], league_id, season)
 
+                # Form & xG
                 h_form, h_xg = get_team_form_and_goals(home["id"], league_id, season)
                 a_form, a_xg = get_team_form_and_goals(away["id"], league_id, season)
                 home["form"], home["xg"] = h_form, h_xg
                 away["form"], away["xg"] = a_form, a_xg
 
+                # Recent goals
                 home["recent_goals"] = get_recent_goals(home["id"])
                 away["recent_goals"] = get_recent_goals(away["id"])
 
+                # Injuries
                 home["injuries"] = get_team_injuries(home["id"], season)
                 away["injuries"] = get_team_injuries(away["id"], season)
 
-                h2h = get_head_to_head(home["id"], away["id"]) or []
+                # Odds + H2H
+                odds_raw = get_match_odds(fixture_id) or {}
+                h2h = get_head_to_head(home["id"], away["id"])
 
-                match_json = {
+                # Insert (or skip) the match row (store the raw odds snapshot)
+                match_row = {
                     "fixture_id": fixture_id,
                     "date": base["date"],
                     "league": base["league"],
                     "venue": base["venue"],
                     "home_team": home,
                     "away_team": away,
-                    "odds": odds,
+                    "odds": odds_raw,
                     "head_to_head": h2h,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
-
-                # Insert the match row once
                 if not exists:
                     try:
-                        insert_match(match_json)
+                        insert_match(match_row)  # your insert_match normalizes odds if needed
                         logger.info(f"✅ Inserted match {fixture_id}")
                     except Exception as e:
                         logger.error(f"❌ Error inserting match {fixture_id}: {e}")
+                        # continue to predictions anyway
 
-                # Prediction (get_prediction returns only over_2_5 block)
-                logger.info(f"🤖 Getting prediction for fixture {fixture_id}")
-                prediction = get_prediction(match_json)
+                # Choose OU2.5 odds (prefer Overtime when linked)
+                over_odds, src = _select_over25_odds(fixture_id, odds_raw)
+
+                if over_odds is None:
+                    logger.info(f"🪙 Skipping GPT for {fixture_id}: no Over 2.5 odds found (src={src}).")
+                    continue
+
+                if not (ODDS_MIN <= over_odds <= ODDS_MAX):
+                    logger.info(
+                        f"🪙 Skipping GPT for {fixture_id}: Over 2.5 {over_odds:.2f} not in range [{ODDS_MIN},{ODDS_MAX}] (src={src})."
+                    )
+                    continue
+
+                # Build the model input – pass only the odds we truly used
+                model_input = deepcopy(match_row)
+                model_input["odds"] = {"over_2_5": over_odds, "source": src}
+
+                # Run prediction
+                logger.info(f"🤖 Getting prediction for fixture {fixture_id} (OU2.5={over_odds:.2f}, src={src})")
+                prediction = get_prediction(model_input)
                 if not prediction:
                     logger.info(f"🟨 No prediction returned for fixture {fixture_id}")
                     failed += 1
                     continue
 
-                block = (prediction.get("predictions") or {}).get("over_2_5")
-
-                if _HAS_REASONED_WRITER:
-                    written, reason = write_value_prediction_with_reasons(int(fixture_id), "over_2_5", block)
-                    logger.info("✍️ value_predictions wrote: %s (reason=%s) for fixture %s", written, reason, fixture_id)
-                else:
-                    try:
-                        wrote = _legacy_insert_value_predictions(prediction)
-                        reason = "LEGACY_PATH"
-                    except Exception as e:
-                        wrote = 0
-                        reason = f"LEGACY_EXCEPTION:{e}"
-                    logger.info("✍️ value_predictions wrote: %s (reason=%s) for fixture %s", wrote, reason, fixture_id)
-
+                # Insert value predictions (confidence/edge gates are enforced inside your util)
+                wrote = insert_value_predictions(prediction)
+                logger.info(f"🟢 value_predictions wrote: {wrote} for fixture {fixture_id}")
                 successful += 1
 
             except Exception as e:
@@ -361,6 +316,6 @@ def main():
         logger.error(f"❌ Critical error in main: {e}")
         sys.exit(1)
 
-# ------------------------------------------------------------------------------
+
 if __name__ == "__main__":
     main()
