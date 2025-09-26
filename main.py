@@ -301,7 +301,7 @@ def main():
                     continue
 
                 # Insert value predictions (confidence/edge gates are enforced inside your util)
-                wrote = insert_value_predictions(prediction)
+                wrote = insert_value_predictions(prediction, odds_source=src)
                 logger.info(f"🟢 value_predictions wrote: {wrote} for fixture {fixture_id}")
                 successful += 1
 
