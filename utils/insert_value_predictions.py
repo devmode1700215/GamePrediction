@@ -6,8 +6,8 @@ from utils.supabaseClient import supabase
 
 ODDS_MIN = float(os.getenv("ODDS_MIN", "1.7"))
 ODDS_MAX = float(os.getenv("ODDS_MAX", "2.3"))
-CONF_MIN = float(os.getenv("CONF_MIN", "70"))
-EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))   # 5% default per your request
+CONF_MIN = float(os.getenv("CONF_MIN", "50"))      # ← default lowered to 50
+EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))
 
 def _to_float(x) -> Optional[float]:
     try: return float(x)
@@ -18,9 +18,6 @@ def _nz(v, default=0.0):
     return f if f is not None else default
 
 def insert_value_predictions(pred: dict, *, odds_source: str = "apifootball") -> Tuple[int, str]:
-    """
-    Returns (rows_written, reason). Reason is 'OK' on success or a clear block cause.
-    """
     try:
         market = pred.get("market")
         if market not in ("over_2_5", "btts"):
@@ -69,9 +66,6 @@ def insert_value_predictions(pred: dict, *, odds_source: str = "apifootball") ->
             .upsert(row, on_conflict="fixture_id,market")
             .execute()
         )
-
-        # Treat no-error as success even if res.data is empty (PostgREST config)
         return 1, "OK"
-
     except Exception as e:
         return 0, f"HTTP_EXCEPTION:{e}"
