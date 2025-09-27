@@ -23,25 +23,21 @@ from utils.insert_match import insert_match
 from utils.get_matches_needing_results import get_matches_needing_results
 from utils.supabaseClient import supabase
 
-# ───────────────────────── Logging & ENV ─────────────────────────
+# ───────────── Logging & ENV ─────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
 load_dotenv()
-
 ODDS_MIN = float(os.getenv("ODDS_MIN", "1.7"))
 ODDS_MAX = float(os.getenv("ODDS_MAX", "2.3"))
 
-# ───────────────────────── Helpers ─────────────────────────
+# ───────────── Helpers ─────────────
 def _to_float(x):
     try:
         return float(x)
     except Exception:
         return None
 
-
 def safe_extract_match_data(match):
-    """Safely extract the minimal structure we need from the API fixture."""
     try:
         fixture = match.get("fixture", {})
         teams = match.get("teams", {})
@@ -78,7 +74,6 @@ def safe_extract_match_data(match):
     except Exception:
         return None
 
-
 def update_results_for_finished_matches():
     try:
         matches = get_matches_needing_results()
@@ -92,46 +87,32 @@ def update_results_for_finished_matches():
     except Exception as e:
         logger.error(f"❌ Error updating results: {e}")
 
-
 def _read_over25_from_matches_odds(odds: dict):
-    """Accept both flat and nested shapes from matches.odds."""
     if not isinstance(odds, dict):
         return None
-    # flat: {"over_2_5": 1.85} or "1.85"
     if "over_2_5" in odds:
         v = odds["over_2_5"]
         if isinstance(v, dict) and "over" in v:
             return _to_float(v.get("over"))
         return _to_float(v)
-    # sometimes: {"ou_2_5": {"over": 1.85, "under": 1.95}}
     if "ou_2_5" in odds and isinstance(odds["ou_2_5"], dict):
         return _to_float(odds["ou_2_5"].get("over"))
     return None
 
-
 def _read_over25_from_ot_odds(ot_odds: dict):
-    """
-    Overtime stores OU as {'ou_2_5': {'over': x, 'under': y}}.
-    Some feeds flatten as 'ou_2_5_over' or 'ou25_over'.
-    """
     if not isinstance(ot_odds, dict):
         return None
     if "ou_2_5" in ot_odds and isinstance(ot_odds["ou_2_5"], dict):
         return _to_float(ot_odds["ou_2_5"].get("over"))
     for k in ("ou_2_5_over", "ou25_over"):
         if k in ot_odds:
-            v = _to_float(ot_odds.get(k))
-            if v is not None:
-                return v
+            f = _to_float(ot_odds.get(k))
+            if f is not None:
+                return f
     return None
 
-
 def _select_over25_odds(fixture_id: int, matches_odds: dict):
-    """
-    Prefer Overtime OU2.5 'over' when a link exists; otherwise use matches.odds.
-    Returns (odds_value or None, 'overtime'|'apifootball'|'none').
-    """
-    # 1) Try Overtime if linked
+    # 1) Overtime (if linked)
     try:
         link_q = (
             supabase.table("ot_links")
@@ -154,92 +135,69 @@ def _select_over25_odds(fixture_id: int, matches_odds: dict):
             if over is not None:
                 return over, "overtime"
     except Exception:
-        # fall through
         pass
-
-    # 2) Fall back to matches.odds
+    # 2) API-Football fallback
     over = _read_over25_from_matches_odds(matches_odds or {})
     if over is not None:
         return over, "apifootball"
-
     return None, "none"
 
-
 def _normalize_prediction_shape(pred: dict) -> dict:
-    """Force a stable shape for insert_value_predictions."""
     if not isinstance(pred, dict):
         return {}
-    out = dict(pred)  # shallow copy
-
-    # 1) Market mapping / default to OU 2.5 for current pipeline
+    out = dict(pred)
+    # market
     m = (out.get("market") or out.get("market_name") or out.get("marketType") or "").lower().strip()
-    if m in ("ou_2_5", "ou25", "over25", "o/u 2.5", "o/u2.5", "over_2_5"):
+    if m in ("ou_2_5","ou25","over25","o/u 2.5","o/u2.5","over_2_5",""):
         m = "over_2_5"
-    elif m in ("btts", "both_to_score", "both_teams_to_score", "gg", "yes/no"):
+    elif m in ("btts","both_to_score","both_teams_to_score","gg","yes/no"):
         m = "btts"
-    if not m:
-        m = "over_2_5"
     out["market"] = m
-
-    # 2) Pick mapping
+    # pick
     pick = out.get("prediction") or out.get("pick") or out.get("side")
     if isinstance(pick, str):
         p = pick.lower().strip()
-        mapping = {"over": "Over", "under": "Under", "yes": "Yes", "no": "No"}
-        out["prediction"] = mapping.get(p, out.get("prediction")) or ("Over" if m == "over_2_5" else None)
-
-    # 3) Numeric coercions & odds extraction
+        mapping = {"over":"Over","under":"Under","yes":"Yes","no":"No"}
+        out["prediction"] = mapping.get(p, out.get("prediction")) or ("Over" if m=="over_2_5" else None)
+    # numbers
     def _f(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
-
+        try: return float(x)
+        except Exception: return None
     if out.get("odds") is None:
-        candidates = [
+        cands = [
             out.get("market_odds"),
             (out.get("prices") or {}).get("over") if isinstance(out.get("prices"), dict) else None,
             (out.get("selection") or {}).get("odds") if isinstance(out.get("selection"), dict) else None,
-            (out.get("markets") or {}).get(m, {}).get("odds") if isinstance(out.get("markets"), dict) else None,
-            (out.get("markets") or {}).get(m, {}).get("over") if isinstance(out.get("markets"), dict) else None,
-            (out.get("market_details") or {}).get("odds") if isinstance(out.get("market_details"), dict) else None,
         ]
-        for c in candidates:
+        for c in cands:
             fc = _f(c)
             if fc is not None:
                 out["odds"] = fc
                 break
     else:
-        out["odds"] = _f(out.get("odds"))
-
-    for k in ("confidence_pct", "edge", "stake_pct"):
-        if k in out and not isinstance(out[k], (int, float)):
+        out["odds"] = _f(out["odds"])
+    for k in ("confidence_pct","edge","stake_pct","p_over_2_5","p_under_2_5"):
+        if k in out and not isinstance(out[k], (int,float)):
             out[k] = _f(out[k])
-
-    # 4) Ensure po_value exists
     if "po_value" not in out:
         e = out.get("edge")
         out["po_value"] = True if (e is not None and e > 0) else bool(out.get("po_value", False))
-
     return out
 
-
-# ───────────────────────── Main ─────────────────────────
+# ───────────── Main ─────────────
 def main():
     try:
         logger.info("🚀 Starting football prediction system… Odds gate: [%s, %s]", ODDS_MIN, ODDS_MAX)
-
-        # 1) Update results first
+        # 1) results
         update_results_for_finished_matches()
 
-        # 2) Build a 48h window: today + tomorrow + day after
+        # 2) fixtures for next 48h
         now = datetime.now(timezone.utc)
         d0 = now.strftime("%Y-%m-%d")
         d1 = (now + timedelta(days=1)).strftime("%Y-%m-%d")
         d2 = (now + timedelta(days=2)).strftime("%Y-%m-%d")
 
         logger.info(f"📅 Fetching fixtures for {d0}, {d1}, {d2}")
-
         fixtures = []
         for d in (d0, d1, d2):
             try:
@@ -250,12 +208,10 @@ def main():
             if isinstance(day, list):
                 fixtures.extend(day)
 
-        # Filter fixtures to the next 48h by timestamp (if available)
         horizon = now + timedelta(hours=48)
         try:
             fixtures = [
-                f
-                for f in fixtures
+                f for f in fixtures
                 if f.get("fixture", {}).get("timestamp")
                 and now.timestamp() <= f["fixture"]["timestamp"] <= horizon.timestamp()
             ]
@@ -276,45 +232,30 @@ def main():
                     continue
 
                 fixture_id = base["fixture_id"]
-
-                # Check if we already have a matches row; if yes, do not insert again
                 already = supabase.table("matches").select("fixture_id").eq("fixture_id", fixture_id).execute()
                 exists = bool(already.data)
 
-                # Gather extra team data we feed to GPT
-                season = base["season"]
-                league_id = base["league_id"]
+                season = base["season"]; league_id = base["league_id"]
                 if not season or not league_id:
                     logger.info(f"🟨 Missing season/league for {fixture_id}; skipping.")
                     failed += 1
                     continue
 
-                home = deepcopy(base["home_team"])
-                away = deepcopy(base["away_team"])
-
-                # Team positions
+                home = deepcopy(base["home_team"]); away = deepcopy(base["away_team"])
                 home["position"] = get_team_position(home["id"], league_id, season)
                 away["position"] = get_team_position(away["id"], league_id, season)
-
-                # Form & xG
                 h_form, h_xg = get_team_form_and_goals(home["id"], league_id, season)
                 a_form, a_xg = get_team_form_and_goals(away["id"], league_id, season)
                 home["form"], home["xg"] = h_form, h_xg
                 away["form"], away["xg"] = a_form, a_xg
-
-                # Recent goals
                 home["recent_goals"] = get_recent_goals(home["id"])
                 away["recent_goals"] = get_recent_goals(away["id"])
-
-                # Injuries
                 home["injuries"] = get_team_injuries(home["id"], season)
                 away["injuries"] = get_team_injuries(away["id"], season)
 
-                # Odds + H2H
                 odds_raw = get_match_odds(fixture_id) or {}
                 h2h = get_head_to_head(home["id"], away["id"])
 
-                # Insert (or skip) the match row (store the raw odds snapshot)
                 match_row = {
                     "fixture_id": fixture_id,
                     "date": base["date"],
@@ -328,30 +269,23 @@ def main():
                 }
                 if not exists:
                     try:
-                        insert_match(match_row)  # your insert_match may normalize odds
+                        insert_match(match_row)
                         logger.info(f"✅ Inserted match {fixture_id}")
                     except Exception as e:
                         logger.error(f"❌ Error inserting match {fixture_id}: {e}")
-                        # continue to predictions anyway
 
-                # Choose OU2.5 odds (prefer Overtime when linked)
+                # ---- PRE-GPT ODDS GATE (saves tokens) ----
                 over_odds, src = _select_over25_odds(fixture_id, odds_raw)
-
                 if over_odds is None:
                     logger.info(f"🪙 Skipping GPT for {fixture_id}: no Over 2.5 odds found (src={src}).")
                     continue
-
                 if not (ODDS_MIN <= over_odds <= ODDS_MAX):
-                    logger.info(
-                        f"🪙 Skipping GPT for {fixture_id}: Over 2.5 {over_odds:.2f} not in range [{ODDS_MIN},{ODDS_MAX}] (src={src})."
-                    )
+                    logger.info(f"🪙 Skipping GPT for {fixture_id}: Over 2.5 {over_odds:.2f} not in range [{ODDS_MIN},{ODDS_MAX}] (src={src}).")
                     continue
 
-                # Build the model input – pass only the odds we truly used
                 model_input = deepcopy(match_row)
                 model_input["odds"] = {"over_2_5": over_odds, "source": src}
 
-                # Run prediction
                 logger.info(f"🤖 Getting prediction for fixture {fixture_id} (OU2.5={over_odds:.2f}, src={src})")
                 prediction = get_prediction(model_input)
                 if not prediction:
@@ -359,17 +293,11 @@ def main():
                     failed += 1
                     continue
 
-                # Normalize shape so market is always present (defaults to over_2_5)
                 prediction = _normalize_prediction_shape(prediction)
-
-                # Ensure odds exist in the prediction (backfill with the exact gated price)
                 if prediction.get("odds") is None:
                     prediction["odds"] = float(over_odds)
-
-                # Ensure fixture_id present
                 prediction.setdefault("fixture_id", fixture_id)
 
-                # Write value prediction (handle both old and new return types)
                 res = insert_value_predictions(prediction, odds_source=src)
                 if isinstance(res, tuple):
                     wrote, reason = res
@@ -384,10 +312,9 @@ def main():
                     failed += 1
 
             except Exception as e:
-                try:
-                    fid = match.get('fixture', {}).get('id')
-                except Exception:
-                    fid = None
+                fid = None
+                try: fid = match.get('fixture', {}).get('id')
+                except Exception: pass
                 logger.error(f"❌ Unexpected error processing fixture {fid}: {e}")
                 failed += 1
                 continue
@@ -397,7 +324,6 @@ def main():
     except Exception as e:
         logger.error(f"❌ Critical error in main: {e}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
