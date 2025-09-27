@@ -335,6 +335,11 @@ def main():
 
                 # Normalize shape so market is always present (defaults to over_2_5)
                 prediction = _normalize_prediction_shape(prediction)
+                
+                # If the model didn’t echo odds, use the exact OU2.5 price we selected
+if prediction.get("odds") is None:
+    prediction["odds"] = float(over_odds)
+
 
                 # Insert value predictions (handle both old and new return types)
                 res = insert_value_predictions(prediction, odds_source=src)
