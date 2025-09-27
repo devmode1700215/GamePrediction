@@ -1,13 +1,13 @@
 # utils/get_prediction.py
 import os, json, math, statistics
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 from openai import OpenAI
 
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")
-PRED_SAMPLES = max(1, int(os.getenv("PRED_SAMPLES", "2")))      # 1–3 is plenty
-PRED_TEMP = float(os.getenv("PRED_TEMP", "0.2"))                 # low temperature for stability
-EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))                  # 5% by default (you asked for this)
+PRED_SAMPLES = max(1, int(os.getenv("PRED_SAMPLES", "2")))      # 1–3 is fine
+PRED_TEMP = float(os.getenv("PRED_TEMP", "0.2"))                 # low for stability
+EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))                  # 5% default
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))      # 25% Kelly
 
 _client = None
@@ -57,7 +57,7 @@ def _msg_user(payload: Dict[str, Any]) -> Dict[str, str]:
     }
 
 def _one_call(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Single JSON-mode chat call. Returns parsed dict with required fields or raises."""
+    """Single JSON-mode chat call. Returns parsed dict with required fields."""
     resp = _client_lazy().chat.completions.create(
         model=MODEL_NAME,
         temperature=PRED_TEMP,
@@ -67,20 +67,25 @@ def _one_call(payload: Dict[str, Any]) -> Dict[str, Any]:
     content = resp.choices[0].message.content or "{}"
     data = json.loads(content)
     # basic shape guard
-    out = {
-        "market": "over_2_5",
-        "p_over_2_5": float(data.get("p_over_2_5", 0.5)),
-        "p_under_2_5": float(data.get("p_under_2_5", max(0.0, 1.0 - float(data.get("p_over_2_5", 0.5))))),
-        "prediction": data.get("prediction") or ("Over" if float(data.get("p_over_2_5", 0.5)) >= 0.5 else "Under"),
-        "confidence_pct": float(data.get("confidence_pct", 70)),
-    }
+    p_over = float(data.get("p_over_2_5", 0.5))
+    p_under = float(data.get("p_under_2_5", max(0.0, 1.0 - p_over)))
+    pred = data.get("prediction") or ("Over" if p_over >= 0.5 else "Under")
+    conf = float(data.get("confidence_pct", 70.0))
+
     # clamp
-    out["p_over_2_5"] = max(0.0, min(1.0, out["p_over_2_5"]))
-    out["p_under_2_5"] = max(0.0, min(1.0, out["p_under_2_5"]))
-    return out
+    p_over = max(0.0, min(1.0, p_over))
+    p_under = max(0.0, min(1.0, p_under))
+
+    return {
+        "market": "over_2_5",
+        "p_over_2_5": p_over,
+        "p_under_2_5": p_under,
+        "prediction": pred,
+        "confidence_pct": conf,
+    }
 
 def _kelly(p: float, odds: float) -> float:
-    """Full Kelly fraction for even-odds-style bet on 'Over'. b = odds-1."""
+    """Full Kelly fraction for a bet at decimal odds 'odds' with probability p."""
     b = max(0.0, odds - 1.0)
     if b <= 0 or p <= 0 or p >= 1:
         return 0.0
@@ -93,43 +98,48 @@ def get_prediction(match_payload: Dict[str, Any]) -> Dict[str, Any]:
     Returns a normalized dict:
     {
       fixture_id, market, prediction, p_over_2_5, p_under_2_5,
-      confidence_pct, edge, stake_pct, odds, po_value
+      confidence_pct, edge, stake_pct, odds, po_value, samples, span
     }
-    Edge and stake are computed here for consistency.
     """
     price = match_payload.get("odds", {}).get("over_2_5")
     if price is None:
-        # caller should prefilter odds; still guard
         return {}
 
+    # 1) Multiple low-temp samples for stability
     samples: List[Dict[str, Any]] = []
     for _ in range(PRED_SAMPLES):
         try:
             samples.append(_one_call(match_payload))
         except Exception:
             continue
-
     if not samples:
         return {}
 
-    # aggregate by median for robustness
+    # 2) Aggregate probabilities by median
     p_over_list = [s["p_over_2_5"] for s in samples]
-    conf_list = [s.get("confidence_pct", 70.0) for s in samples]
     p_over = statistics.median(p_over_list)
-    conf = statistics.median(conf_list)
     span = max(p_over_list) - min(p_over_list)
 
-    # OPTIONAL stability penalty on confidence (small)
-    conf_eff = max(0.0, min(100.0, conf * (1.0 - min(0.5, span))))  # reduce up to 50% if unstable
+    # 3) Confidence: probability distance from 50%, lightly penalized by instability
+    #    - Base confidence purely from p: 0 at 50/50, 100 at 0% or 100%
+    conf_prob = abs(p_over - 0.5) * 200.0
+    #    - Model-reported confidence (median) as a floor/alternative
+    conf_model = statistics.median([s.get("confidence_pct", 70.0) for s in samples])
+    conf = max(conf_prob, conf_model)
+    #    - Light stability penalty (max 20% reduction)
+    conf *= (1.0 - min(0.2, span))  # span in [0,1]; cap penalty @20%
+    conf = max(0.0, min(100.0, conf))
 
-    # Compute edge and stake
-    edge = p_over * float(price) - 1.0
-    k_full = _kelly(p_over, float(price))
+    # 4) Edge & stake (code is source of truth)
+    price = float(price)
+    p_over = float(p_over)
+    edge = p_over * price - 1.0
+    k_full = _kelly(p_over, price)
     stake_pct = round(100.0 * KELLY_FRACTION * k_full, 2)
 
-    # Final pick
+    # 5) Final pick + povalue (we only bet Over 2.5 in pipeline)
     pick = "Over" if p_over >= 0.5 else "Under"
-    po_value = (edge >= EDGE_MIN) and (pick == "Over")  # we only bet Over 2.5 in current pipeline
+    po_value = (edge >= EDGE_MIN) and (pick == "Over")
 
     return {
         "fixture_id": match_payload.get("fixture_id"),
@@ -137,12 +147,11 @@ def get_prediction(match_payload: Dict[str, Any]) -> Dict[str, Any]:
         "prediction": pick,
         "p_over_2_5": round(p_over, 4),
         "p_under_2_5": round(1.0 - p_over, 4),
-        "confidence_pct": round(conf_eff, 1),
+        "confidence_pct": round(conf, 1),
         "edge": round(edge, 4),
         "stake_pct": stake_pct,
-        "odds": float(price),
+        "odds": price,
         "po_value": bool(po_value),
-        # (optional) keep for debugging
         "samples": len(samples),
         "span": round(span, 4),
     }
