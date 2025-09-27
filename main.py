@@ -103,7 +103,7 @@ def _read_over25_from_matches_odds(odds: dict):
         if isinstance(v, dict) and "over" in v:
             return _to_float(v.get("over"))
         return _to_float(v)
-    # sometimes inserted as {"ou_2_5": {"over": 1.85, "under": 1.95}}
+    # sometimes: {"ou_2_5": {"over": 1.85, "under": 1.95}}
     if "ou_2_5" in odds and isinstance(odds["ou_2_5"], dict):
         return _to_float(odds["ou_2_5"].get("over"))
     return None
@@ -137,17 +137,19 @@ def _select_over25_odds(fixture_id: int, matches_odds: dict):
             supabase.table("ot_links")
             .select("game_id")
             .eq("fixture_id", fixture_id)
+            .single()
             .execute()
         )
-        game_id = (link_q.data or [{}])[0].get("game_id") if (link_q.data) else None
+        game_id = (link_q.data or {}).get("game_id")
         if game_id:
             mot_q = (
                 supabase.table("matches_ot")
                 .select("odds")
                 .eq("game_id", game_id)
+                .single()
                 .execute()
             )
-            ot_odds = (mot_q.data or [{}])[0].get("odds")
+            ot_odds = (mot_q.data or {}).get("odds")
             over = _read_over25_from_ot_odds(ot_odds)
             if over is not None:
                 return over, "overtime"
@@ -196,11 +198,11 @@ def _normalize_prediction_shape(pred: dict) -> dict:
     if out.get("odds") is None:
         candidates = [
             out.get("market_odds"),
-            (out.get("prices") or {}).get("over"),
-            (out.get("selection") or {}).get("odds"),
+            (out.get("prices") or {}).get("over") if isinstance(out.get("prices"), dict) else None,
+            (out.get("selection") or {}).get("odds") if isinstance(out.get("selection"), dict) else None,
             (out.get("markets") or {}).get(m, {}).get("odds") if isinstance(out.get("markets"), dict) else None,
             (out.get("markets") or {}).get(m, {}).get("over") if isinstance(out.get("markets"), dict) else None,
-            (out.get("market_details") or {}).get("odds"),
+            (out.get("market_details") or {}).get("odds") if isinstance(out.get("market_details"), dict) else None,
         ]
         for c in candidates:
             fc = _f(c)
@@ -326,7 +328,7 @@ def main():
                 }
                 if not exists:
                     try:
-                        insert_match(match_row)  # your insert_match normalizes odds if needed
+                        insert_match(match_row)  # your insert_match may normalize odds
                         logger.info(f"✅ Inserted match {fixture_id}")
                     except Exception as e:
                         logger.error(f"❌ Error inserting match {fixture_id}: {e}")
@@ -359,13 +361,15 @@ def main():
 
                 # Normalize shape so market is always present (defaults to over_2_5)
                 prediction = _normalize_prediction_shape(prediction)
-                
-                # If the model didn’t echo odds, use the exact OU2.5 price we selected
-if prediction.get("odds") is None:
-    prediction["odds"] = float(over_odds)
 
+                # Ensure odds exist in the prediction (backfill with the exact gated price)
+                if prediction.get("odds") is None:
+                    prediction["odds"] = float(over_odds)
 
-                # Insert value predictions (handle both old and new return types)
+                # Ensure fixture_id present
+                prediction.setdefault("fixture_id", fixture_id)
+
+                # Write value prediction (handle both old and new return types)
                 res = insert_value_predictions(prediction, odds_source=src)
                 if isinstance(res, tuple):
                     wrote, reason = res
@@ -380,7 +384,11 @@ if prediction.get("odds") is None:
                     failed += 1
 
             except Exception as e:
-                logger.error(f"❌ Unexpected error processing fixture {match.get('fixture', {}).get('id')}: {e}")
+                try:
+                    fid = match.get('fixture', {}).get('id')
+                except Exception:
+                    fid = None
+                logger.error(f"❌ Unexpected error processing fixture {fid}: {e}")
                 failed += 1
                 continue
 
