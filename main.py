@@ -169,7 +169,7 @@ def _normalize_prediction_shape(pred: dict) -> dict:
         return {}
     out = dict(pred)  # shallow copy
 
-    # Market mapping / default to OU 2.5 for current pipeline
+    # 1) Market mapping / default to OU 2.5 for current pipeline
     m = (out.get("market") or out.get("market_name") or out.get("marketType") or "").lower().strip()
     if m in ("ou_2_5", "ou25", "over25", "o/u 2.5", "o/u2.5", "over_2_5"):
         m = "over_2_5"
@@ -179,24 +179,48 @@ def _normalize_prediction_shape(pred: dict) -> dict:
         m = "over_2_5"
     out["market"] = m
 
-    # Pick mapping
+    # 2) Pick mapping
     pick = out.get("prediction") or out.get("pick") or out.get("side")
     if isinstance(pick, str):
         p = pick.lower().strip()
         mapping = {"over": "Over", "under": "Under", "yes": "Yes", "no": "No"}
         out["prediction"] = mapping.get(p, out.get("prediction")) or ("Over" if m == "over_2_5" else None)
 
-    # Numeric coercions
-    for k in ("odds", "confidence_pct", "edge", "stake_pct"):
-        if k in out and not isinstance(out[k], (int, float)):
-            out[k] = _to_float(out[k])
+    # 3) Numeric coercions & odds extraction
+    def _f(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
 
-    # po_value default if missing
+    if out.get("odds") is None:
+        candidates = [
+            out.get("market_odds"),
+            (out.get("prices") or {}).get("over"),
+            (out.get("selection") or {}).get("odds"),
+            (out.get("markets") or {}).get(m, {}).get("odds") if isinstance(out.get("markets"), dict) else None,
+            (out.get("markets") or {}).get(m, {}).get("over") if isinstance(out.get("markets"), dict) else None,
+            (out.get("market_details") or {}).get("odds"),
+        ]
+        for c in candidates:
+            fc = _f(c)
+            if fc is not None:
+                out["odds"] = fc
+                break
+    else:
+        out["odds"] = _f(out.get("odds"))
+
+    for k in ("confidence_pct", "edge", "stake_pct"):
+        if k in out and not isinstance(out[k], (int, float)):
+            out[k] = _f(out[k])
+
+    # 4) Ensure po_value exists
     if "po_value" not in out:
         e = out.get("edge")
         out["po_value"] = True if (e is not None and e > 0) else bool(out.get("po_value", False))
 
     return out
+
 
 # ───────────────────────── Main ─────────────────────────
 def main():
