@@ -3,7 +3,7 @@ import os
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -23,28 +23,39 @@ HDRS = {
     "Content-Type": "application/json",
 }
 
-# --- Use your existing fetcher for fixtures ---
+# Use your existing fetcher for fixtures
 try:
     from utils.get_football_data import fetch_fixtures
 except Exception as e:
     raise ImportError("utils.get_football_data.fetch_fixtures is required for settlement") from e
 
 
-# ---------- helpers ----------
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _pg_get(path: str, params: Dict[str, Any]) -> requests.Response:
     return requests.get(f"{SB_URL.rstrip('/')}{path}", headers=HDRS, params=params, timeout=25)
 
-def _pg_patch(path: str, params: Dict[str, Any], payload: Dict[str, Any]) -> requests.Response:
-    return requests.patch(f"{SB_URL.rstrip('/')}{path}", headers=HDRS, params=params, data=json.dumps(payload), timeout=25)
 
-def _pg_post(path: str, params: Dict[str, Any], payload: Any) -> requests.Response:
-    return requests.post(f"{SB_URL.rstrip('/')}{path}", headers=HDRS, params=params, data=json.dumps(payload), timeout=25)
+def _verifications_upsert(prediction_id: str, is_correct: Optional[bool]) -> bool:
+    """
+    Proper upsert into verifications with PK on prediction_id.
+    """
+    if not prediction_id:
+        return False
+    params = {"on_conflict": "prediction_id"}
+    headers = dict(HDRS)
+    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    payload = [{"prediction_id": prediction_id, "is_correct": is_correct}]
+    r = requests.post(f"{SB_URL.rstrip('/')}/rest/v1/{VER_TABLE}",
+                      headers=headers, params=params, data=json.dumps(payload), timeout=25)
+    if r.status_code >= 400:
+        logging.error(f"[settle] UPSERT {VER_TABLE} failed: {r.status_code} {r.text}")
+        return False
+    return True
 
 
-# ---------- value_predictions lookup / write ----------
 def _get_latest_prediction_row(fixture_id: int, market: str = MARKET) -> Optional[Dict[str, Any]]:
     """
     Fetch latest value_prediction for fixture+market.
@@ -65,47 +76,17 @@ def _get_latest_prediction_row(fixture_id: int, market: str = MARKET) -> Optiona
     return rows[0] if rows else None
 
 
-def _patch_value_prediction_result(fixture_id: int, update: Dict[str, Any]) -> bool:
-    """
-    Best-effort patch to add result info into value_predictions.
-    If your schema doesn’t have these columns, we log and continue.
-    """
-    params = {"fixture_id": f"eq.{fixture_id}", "market": f"eq.{MARKET}"}
-    r = _pg_patch(f"/rest/v1/{VP_TABLE}", params, update)
-    if r.status_code >= 400:
-        logging.info(f"[settle] PATCH {VP_TABLE} ignored or failed (maybe columns not present): {r.status_code} {r.text}")
-        return False
-    return True
-
-
-def _upsert_verification(prediction_id: str, is_correct: Optional[bool]) -> bool:
-    """
-    Upsert into verifications with PK/FK on prediction_id.
-    If your table has only (prediction_id, is_correct), this will work.
-    If it also has timestamps, PostgREST will fill defaults.
-    """
-    params = {"on_conflict": "prediction_id"}
-    payload = [{"prediction_id": prediction_id, "is_correct": is_correct}]
-    r = _pg_post(f"/rest/v1/{VER_TABLE}", params, payload)
-    if r.status_code >= 400:
-        logging.error(f"[settle] POST {VER_TABLE} failed: {r.status_code} {r.text}")
-        return False
-    return True
-
-
-# ---------- fixture parsing ----------
 def _is_finished(fx: Dict[str, Any]) -> bool:
     status = (((fx or {}).get("fixture") or {}).get("status") or {}).get("short")
     return status in {"FT", "AET", "PEN"}
 
+
 def _total_goals(fx: Dict[str, Any]) -> Optional[int]:
-    # Primary: goals.home/away
     goals = (fx or {}).get("goals") or {}
     try:
         return int(goals.get("home") or 0) + int(goals.get("away") or 0)
     except Exception:
         pass
-    # Fallback: score.fulltime.home/away
     score = (fx or {}).get("score") or {}
     ft = score.get("fulltime") or {}
     try:
@@ -113,17 +94,19 @@ def _total_goals(fx: Dict[str, Any]) -> Optional[int]:
     except Exception:
         return None
 
+
 def _result_side_from_total(total: Optional[int]) -> Optional[str]:
     if total is None:
         return None
-    return "Over" if total > 2 else "Under"  # OU 2.5
+    return "Over" if total > 2 else "Under"  # OU 2.5 threshold
 
 
-# ---------- public API ----------
 def settle_date(date_str: str) -> int:
     """
     Settle all finished fixtures for a given YYYY-MM-DD date.
-    Returns: number of value_prediction rows updated (verifications written).
+    Writes/updates verifications rows; no longer patches value_predictions columns
+    that are not in your schema.
+    Returns count of verifications written/updated.
     """
     try:
         fixtures: List[Dict[str, Any]] = fetch_fixtures(date_str) or []
@@ -156,36 +139,12 @@ def settle_date(date_str: str) -> int:
             pred_id = vp.get("id")
             won = (pick == side)
 
-            # Try to patch the prediction row with result data (best-effort)
-            _patch_value_prediction_result(
-                fixture_id,
-                {
-                    "settled": True,
-                    "settled_at": _now_iso(),
-                    "result_goals": total,
-                    "result_side": side,
-                    "won": won,
-                },
-            )
-
-            # Write to verifications table (authoritative correctness link)
-            if pred_id and _upsert_verification(pred_id, won):
+            # Authoritative correctness record (UPSERT)
+            if pred_id and _verifications_upsert(pred_id, won):
                 updated += 1
                 logging.info(f"[settle] ✅ Fixture {fixture_id}: total={total} side={side} pick={pick} won={won}")
+
         except Exception as e:
             logging.error(f"[settle] error: {e}")
 
     return updated
-
-
-def settle_fixtures(fixture_ids: List[int]) -> int:
-    """
-    Settle a provided list of fixture IDs (useful for re-runs).
-    """
-    # We don’t have a 'fetch_fixture_by_id', so we run by date around now.
-    # Prefer settle_date() for accuracy; this is a shim for quick replays.
-    count = 0
-    for _ in fixture_ids:
-        # Nothing reliable w/o a by-id fetch; keep interface for future extension.
-        pass
-    return count
