@@ -14,35 +14,39 @@ logging.basicConfig(
 )
 
 # ----------------------------
-# Repo modules already in your project
+# Config
 # ----------------------------
-from utils.get_football_data import fetch_fixtures, get_head_to_head
-from utils.cached_football_data import get_match_odds
+ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
+PREFERRED_BOOK = os.getenv("PREF_BOOK", "Bwin")
+INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
+
+# ----------------------------
+# Repo utils
+# ----------------------------
+from utils.get_football_data import (
+    fetch_fixtures,
+    get_head_to_head,
+    get_match_odds,
+    enrich_fixture,
+)
 from utils.insert_match import insert_match
 from utils.insert_value_predictions import insert_value_predictions
 from utils.get_prediction import get_prediction
 
-# Optional: inverter present, but we’ll guard it behind an env flag
+# Optional inverter; guarded by env flag
 try:
     from utils.value_inversion import invert_ou25_prediction
     _HAS_INVERTER = True
 except Exception:
     _HAS_INVERTER = False
 
-# Optional result settlement (will be skipped if the module isn't present)
+# Optional result settlement
 try:
     from utils.settle_results import settle_date
     _HAS_SETTLER = True
 except Exception as _e:
     logging.info(f"Result settlement module not found (utils.settle_results): {_e}")
     _HAS_SETTLER = False
-
-
-# ----------------------------
-# Config
-# ----------------------------
-ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
-INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
 
 
 # ----------------------------
@@ -67,28 +71,60 @@ def _date_str_brussels_days_ago(days: int) -> str:
     return target.strftime("%Y-%m-%d")
 
 
-def _build_match_payload_from_fixture(
-    fx: Dict[str, Any],
+def _choose_ou_odds(fx: Dict[str, Any], fixture_id: int) -> Dict[str, Optional[float]]:
+    """
+    Return {'over_2_5': float|None, 'under_2_5': float|None} using:
+      1) enriched 'ou25_market' if present
+      2) fallback to get_match_odds(...)
+    """
+    ou = (fx.get("ou25_market") or {}) if isinstance(fx, dict) else {}
+    over_ = ou.get("over")
+    under_ = ou.get("under")
+    if over_ is not None or under_ is not None:
+        return {"over_2_5": over_, "under_2_5": under_}
+    odds_flat = get_match_odds(fixture_id) or {}
+    return {"over_2_5": odds_flat.get("over_2_5"), "under_2_5": odds_flat.get("under_2_5")}
+
+
+def _build_llm_payload_from_enriched(
+    fx_enriched: Dict[str, Any],
     odds_src: str,
-    odds: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Build the payload expected by utils.get_prediction.get_prediction()."""
-    fixture = fx.get("fixture", {}) or {}
-    league = fx.get("league", {}) or {}
-    teams = fx.get("teams", {}) or {}
+    """
+    Build the INPUT payload for get_prediction(...) with richer context.
+    """
+    fixture = fx_enriched.get("fixture", {}) or {}
+    league = fx_enriched.get("league", {}) or {}
+    teams = fx_enriched.get("teams", {}) or {}
     venue = fixture.get("venue", {}) or {}
 
     home = teams.get("home", {}) or {}
     away = teams.get("away", {}) or {}
 
+    fixture_id = fixture.get("id")
+    league_id = fx_enriched.get("league_id") or league.get("id")
+    season = fx_enriched.get("season") or league.get("season")
+
+    # H2H (last 3)
+    h2h = []
+    try:
+        hid, aid = home.get("id"), away.get("id")
+        if hid and aid:
+            h2h = get_head_to_head(hid, aid, limit=3)
+    except Exception:
+        h2h = []
+
+    # Odds
+    ou = _choose_ou_odds(fx_enriched, fixture_id)
+
     payload = {
-        "fixture_id": fixture.get("id"),
+        "fixture_id": fixture_id,
         "date": fixture.get("date"),
         "league": {
-            "id": league.get("id"),
+            "id": league_id,
             "name": league.get("name"),
             "country": league.get("country"),
-            "season": league.get("season"),
+            "season": season,
         },
         "venue": {
             "id": venue.get("id"),
@@ -103,11 +139,28 @@ def _build_match_payload_from_fixture(
             "id": away.get("id"),
             "name": away.get("name"),
         },
-        "head_to_head": None,  # filled later
+        "head_to_head": h2h,
         "odds": {
-            "over_2_5": odds.get("over_2_5"),
-            "under_2_5": odds.get("under_2_5"),
+            "over_2_5": ou.get("over_2_5"),
+            "under_2_5": ou.get("under_2_5"),
             "source": odds_src,
+        },
+        # New richer blocks for the LLM to use:
+        "recent_form": {
+            "home": fx_enriched.get("recent_form_home"),
+            "away": fx_enriched.get("recent_form_away"),
+        },
+        "season_context": {
+            "home": fx_enriched.get("season_stats_home"),
+            "away": fx_enriched.get("season_stats_away"),
+        },
+        "injuries": {
+            "home": fx_enriched.get("injuries_home"),
+            "away": fx_enriched.get("injuries_away"),
+        },
+        "lineups": {
+            "home": fx_enriched.get("lineup_home"),
+            "away": fx_enriched.get("lineup_away"),
         },
     }
     return payload
@@ -122,7 +175,7 @@ def _maybe_invert(pred: Dict[str, Any], odds_raw: Dict[str, Any]) -> Dict[str, A
         logging.info("Inversion disabled: posting TRUE model prediction.")
         return pred
     if not _HAS_INVERTER:
-        logging.warning("Inversion requested but utils.value_inversion is missing. Posting TRUE prediction.")
+        logging.warning("Inversion requested but inverter not available. Posting TRUE prediction.")
         return pred
     try:
         flipped = invert_ou25_prediction(dict(pred), odds_raw=odds_raw, src=ODDS_SOURCE)
@@ -133,46 +186,38 @@ def _maybe_invert(pred: Dict[str, Any], odds_raw: Dict[str, Any]) -> Dict[str, A
         return pred
 
 
-def _process_fixture(fx: Dict[str, Any]) -> None:
-    """Process a single fixture end-to-end (insert match, predict, optional invert, store)."""
-    fixture_id = (fx.get("fixture") or {}).get("id")
+# ----------------------------
+# Core processing
+# ----------------------------
+def _process_fixture(fx_raw: Dict[str, Any]) -> None:
+    """
+    Enrich -> insert match -> predict -> (optionally invert) -> store prediction.
+    """
+    fixture_id = (fx_raw.get("fixture") or {}).get("id")
     if not fixture_id:
         logging.warning("Skipping fixture without fixture_id.")
         return
 
-    # 1) Upsert the match row (your function accepts API-Football-style fixture dicts)
+    # 1) Enrich the fixture with last-5 form, season context, injuries, lineups, and OU/BTTS markets
+    fx_enriched = enrich_fixture(fx_raw, preferred_bookmaker=PREFERRED_BOOK)
+
+    # 2) Upsert the match row (persists enriched JSONB blocks into matches table)
     try:
-        ok = insert_match(fx)
+        ok = insert_match(fx_enriched)
         if not ok:
             logging.warning(f"⚠️ insert_match returned False for fixture {fixture_id}")
     except Exception as e:
         logging.error(f"❌ insert_match failed for fixture {fixture_id}: {e}")
 
-    # 2) Odds (cached wrapper)
-    try:
-        odds_raw = get_match_odds(fixture_id) or {}
-    except Exception as e:
-        logging.warning(f"⚠️ get_match_odds failed for fixture {fixture_id}: {e}")
-        odds_raw = {}
+    # 3) Build LLM payload with richer context and odds
+    payload = _build_llm_payload_from_enriched(fx_enriched, ODDS_SOURCE)
 
-    # 3) H2H (optional) and payload for predictor
-    try:
-        teams = fx.get("teams") or {}
-        home_id = (teams.get("home") or {}).get("id")
-        away_id = (teams.get("away") or {}).get("id")
-        h2h = get_head_to_head(home_id, away_id, limit=3) if (home_id and away_id) else []
-    except Exception:
-        h2h = []
-
-    payload = _build_match_payload_from_fixture(fx, ODDS_SOURCE, odds_raw)
-    payload["head_to_head"] = h2h
-
-    # Need an Over 2.5 price for predictor; if missing, skip prediction for this fixture
+    # Require Over 2.5 price to proceed (model relies on market prior)
     if payload.get("odds", {}).get("over_2_5") is None:
         logging.info(f"ℹ️ No Over 2.5 price for fixture {fixture_id}; skipping prediction.")
         return
 
-    # 4) Run your predictor (true model output)
+    # 4) True model prediction
     try:
         pred = get_prediction(payload) or {}
     except Exception as e:
@@ -188,10 +233,10 @@ def _process_fixture(fx: Dict[str, Any]) -> None:
     pred.setdefault("fixture_id", fixture_id)
     pred.setdefault("market", "over_2_5")
 
-    # 5) Optionally invert (now DISABLED by default)
-    final_pred = _maybe_invert(pred, odds_raw)
+    # 5) Optional inversion (disabled by default)
+    final_pred = _maybe_invert(pred, payload.get("odds") or {})
 
-    # 6) Store prediction
+    # 6) Store prediction in value_predictions
     try:
         count, msg = insert_value_predictions(final_pred, odds_source=ODDS_SOURCE)
         if count:
@@ -238,13 +283,18 @@ def _parse_fixture_ids_from_argv(argv: List[str]) -> List[int]:
 def _fetch_single_fixture_stub(fixture_id: int) -> Dict[str, Any]:
     """
     Minimal fixture stub so insert_match() doesn't crash when running by fixture id.
-    If you add a fetch-by-id later, plug it here.
+    For CLI runs against explicit IDs. Odds added via get_match_odds.
     """
     try:
         odds = get_match_odds(fixture_id) or {}
     except Exception:
         odds = {}
-    return {"fixture": {"id": fixture_id}, "teams": {}, "league": {}, "odds": odds}
+    return {
+        "fixture": {"id": fixture_id},
+        "teams": {},
+        "league": {},
+        "odds": odds,
+    }
 
 
 # ----------------------------
