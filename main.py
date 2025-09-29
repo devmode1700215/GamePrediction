@@ -251,3 +251,20 @@ if __name__ == "__main__":
             logging.warning(f"Result settlement failed: {e}")
     else:
         logging.info("Result settlement skipped (module not available).")
+        # --- Result settlement (today & yesterday, Europe/Brussels) ---
+try:
+    from utils.settle_results import settle_date
+    from zoneinfo import ZoneInfo
+    from datetime import datetime, timedelta
+
+    now_bru = datetime.now(ZoneInfo("Europe/Brussels"))
+    today_ds = now_bru.strftime("%Y-%m-%d")
+    yday_ds  = (now_bru - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    settled_today = settle_date(today_ds)
+    settled_yday  = settle_date(yday_ds)
+    logging.info(f"✅ Settled {settled_today} results for {today_ds}")
+    logging.info(f"✅ Settled {settled_yday} results for {yday_ds}")
+except Exception as e:
+    logging.warning(f"Result settlement skipped/failed: {e}")
+
