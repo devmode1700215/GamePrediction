@@ -276,7 +276,190 @@ def get_team_form_and_goals(
 
 
 # -----------------------------------------------------------------------------
-# Recent goals (last N via fixtures endpoint)
+# Recent goals / form block (last N fixtures)
+# -----------------------------------------------------------------------------
+def get_team_recent_block(team_id: int, last: int = 5) -> Dict[str, Any]:
+    """
+    Build a compact 'recent_form' block from the last N fixtures for a team.
+    {
+      "last": 5,
+      "results": ["W","D","L","W","W"],
+      "goals_for": [2,1,0,3,1],
+      "goals_against": [1,1,2,0,0],
+      "gf_avg": 1.40,
+      "ga_avg": 0.80,
+      "ou25_rate": 0.60,
+      "btts_rate": 0.40
+    }
+    """
+    url = f"{BASE_URL}/fixtures?team={team_id}&last={last}"
+    resp = safe_get(url, headers=HEADERS)
+    if resp is None:
+        return {"last": last, "results": [], "goals_for": [], "goals_against": [], "gf_avg": None, "ga_avg": None, "ou25_rate": None, "btts_rate": None}
+    try:
+        data = resp.json()
+        matches = data.get("response", []) or []
+        results: List[str] = []
+        gf: List[int] = []
+        ga: List[int] = []
+        ou_hits = 0
+        btts_hits = 0
+        for m in matches:
+            teams = m.get("teams", {}) or {}
+            goals = m.get("goals", {}) or {}
+            home = teams.get("home", {}) or {}
+            away = teams.get("away", {}) or {}
+            gh = int(goals.get("home") or 0)
+            ga_ = int(goals.get("away") or 0)
+            # goals for/against from perspective of team_id
+            if home.get("id") == team_id:
+                gf.append(gh)
+                ga.append(ga_)
+                results.append(_wdl(gh, ga_))
+            else:
+                gf.append(ga_)
+                ga.append(gh)
+                results.append(_wdl(ga_, gh))
+            # OU/BTTS
+            total = gh + ga_
+            if total > 2:
+                ou_hits += 1
+            if gh > 0 and ga_ > 0:
+                btts_hits += 1
+
+        n = max(1, len(matches))
+        gf_avg = round(sum(gf) / n, 2) if gf else None
+        ga_avg = round(sum(ga) / n, 2) if ga else None
+        ou_rate = round(ou_hits / n, 3) if matches else None
+        btts_rate = round(btts_hits / n, 3) if matches else None
+        return {
+            "last": last,
+            "results": results,
+            "goals_for": gf,
+            "goals_against": ga,
+            "gf_avg": gf_avg,
+            "ga_avg": ga_avg,
+            "ou25_rate": ou_rate,
+            "btts_rate": btts_rate,
+        }
+    except Exception as e:
+        logger.error(f"⚠️ Error building recent block for team {team_id}: {e}")
+        return {"last": last, "results": [], "goals_for": [], "goals_against": [], "gf_avg": None, "ga_avg": None, "ou25_rate": None, "btts_rate": None}
+
+
+def _wdl(gf: int, ga: int) -> str:
+    if gf > ga:
+        return "W"
+    if gf < ga:
+        return "L"
+    return "D"
+
+
+# -----------------------------------------------------------------------------
+# Team season context (baseline style)
+# -----------------------------------------------------------------------------
+def get_team_season_context(team_id: int, league_id: Optional[int], season: Optional[int]) -> Dict[str, Any]:
+    """
+    Pulls team/season-wide splits; returns compact block:
+    {
+      "matches": 28,
+      "goals_for_pg": 1.75,
+      "goals_against_pg": 1.00,
+      "ou25_rate": 0.57,
+      "btts_rate": 0.54,
+      "form": "W-W-D-L-W"
+    }
+    """
+    if not league_id or not season:
+        return {"matches": None, "goals_for_pg": None, "goals_against_pg": None, "ou25_rate": None, "btts_rate": None, "form": None}
+
+    url = f"{BASE_URL}/teams/statistics?team={team_id}&league={league_id}&season={season}"
+    resp = safe_get(url, headers=HEADERS)
+    if resp is None:
+        return {"matches": None, "goals_for_pg": None, "goals_against_pg": None, "ou25_rate": None, "btts_rate": None, "form": None}
+    try:
+        s = resp.json().get("response", {}) or {}
+
+        played = ((s.get("fixtures") or {}).get("played") or {}).get("total")
+        goals_for_pg = (((s.get("goals") or {}).get("for") or {}).get("average") or {}).get("total")
+        goals_against_pg = (((s.get("goals") or {}).get("against") or {}).get("average") or {}).get("total")
+
+        # OU2.5 rate from 'goals' buckets if available; fallback None
+        # API doesn't give OU2.5 explicitly; we estimate from distribution if present, else None.
+        ou25_rate = None
+        btts_rate = (((s.get("both_teams_to_score") or {}).get("total") or {}).get("percentage"))
+        try:
+            if isinstance(btts_rate, str) and btts_rate.endswith("%"):
+                btts_rate = round(float(btts_rate[:-1]) / 100.0, 3)
+            elif isinstance(btts_rate, (int, float)):
+                btts_rate = round(float(btts_rate), 3)
+            else:
+                btts_rate = None
+        except Exception:
+            btts_rate = None
+
+        form_raw = s.get("form") or ""
+        form_str = "-".join(list(form_raw)) if form_raw else None
+
+        def _num(x):
+            try:
+                return round(float(x), 2) if x is not None else None
+            except Exception:
+                return None
+
+        return {
+            "matches": played,
+            "goals_for_pg": _num(goals_for_pg),
+            "goals_against_pg": _num(goals_against_pg),
+            "ou25_rate": ou25_rate,
+            "btts_rate": btts_rate,
+            "form": form_str,
+        }
+    except Exception as e:
+        logger.error(f"⚠️ Error parsing team season context team {team_id}: {e}")
+        return {"matches": None, "goals_for_pg": None, "goals_against_pg": None, "ou25_rate": None, "btts_rate": None, "form": None}
+
+
+# -----------------------------------------------------------------------------
+# Lineups (confirmed XI & formation) when available
+# -----------------------------------------------------------------------------
+def get_fixture_lineups(fixture_id: int) -> Dict[str, Any]:
+    """
+    Returns:
+    {
+      "home": {"formation": "4-3-3", "coach": "X", "players": [...]},
+      "away": {"formation": "4-2-3-1", "coach": "Y", "players": [...]}
+    }
+    If not yet available, returns {}.
+    """
+    url = f"{BASE_URL}/fixtures/lineups?fixture={fixture_id}"
+    resp = safe_get(url, headers=HEADERS)
+    if resp is None:
+        return {}
+    try:
+        data = resp.json()
+        arr = data.get("response", []) or []
+        out: Dict[str, Any] = {}
+        for block in arr:
+            team = (block.get("team") or {}).get("id")
+            side = "home" if (block.get("team") or {}).get("name") == (block.get("team") or {}).get("name") else None  # we’ll map by team id later if needed
+            item = {
+                "formation": block.get("formation"),
+                "coach": ((block.get("coach") or {}).get("name")),
+                "players": block.get("startXI") or [],
+                "substitutes": block.get("substitutes") or [],
+            }
+            # We can't know home/away here without fixture teams; caller will map by team ids if desired.
+            # Return both entries keyed by team_id for safety:
+            out[str(team)] = item
+        return out
+    except Exception as e:
+        logger.error(f"⚠️ Error parsing lineups for fixture {fixture_id}: {e}")
+        return {}
+
+
+# -----------------------------------------------------------------------------
+# Recent goals (kept for backward compatibility)
 # -----------------------------------------------------------------------------
 def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
     """
@@ -306,6 +489,71 @@ def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
 
 
 # -----------------------------------------------------------------------------
+# Enrichment: build all blocks for a fixture (drop-in for main/insert)
+# -----------------------------------------------------------------------------
+def enrich_fixture(fx: Dict[str, Any], *, preferred_bookmaker: str = "Bwin") -> Dict[str, Any]:
+    """
+    Returns the original fixture dict plus:
+      - league_id, season
+      - recent_form_home / recent_form_away
+      - season_stats_home / season_stats_away
+      - injuries_home / injuries_away
+      - lineup_home / lineup_away (when available)
+      - btts_market, ou25_market
+    """
+    fixture = fx.get("fixture", {}) or {}
+    league = fx.get("league", {}) or {}
+    teams = fx.get("teams", {}) or {}
+
+    fixture_id = fixture.get("id")
+    league_id = league.get("id")
+    season = league.get("season")
+
+    home = teams.get("home", {}) or {}
+    away = teams.get("away", {}) or {}
+    home_id = home.get("id")
+    away_id = away.get("id")
+
+    # Markets from odds (single bookmaker snapshot)
+    odds = get_match_odds(fixture_id, preferred_bookmaker=preferred_bookmaker)
+    ou25_market = {"over": odds.get("over_2_5"), "under": odds.get("under_2_5")}
+    btts_market = {"yes": odds.get("btts_yes"), "no": odds.get("btts_no")}
+
+    # Recent form blocks
+    recent_home = get_team_recent_block(home_id, last=5) if home_id else {}
+    recent_away = get_team_recent_block(away_id, last=5) if away_id else {}
+
+    # Season context
+    season_home = get_team_season_context(home_id, league_id, season) if home_id else {}
+    season_away = get_team_season_context(away_id, league_id, season) if away_id else {}
+
+    # Injuries
+    injuries_home = get_team_injuries(home_id, season) if home_id else []
+    injuries_away = get_team_injuries(away_id, season) if away_id else []
+
+    # Lineups (dictionary keyed by team_id as string)
+    raw_lineups = get_fixture_lineups(fixture_id) if fixture_id else {}
+    lineup_home = raw_lineups.get(str(home_id)) if home_id else None
+    lineup_away = raw_lineups.get(str(away_id)) if away_id else None
+
+    # Attach enrichment to a copy of the original
+    out = dict(fx)
+    out["league_id"] = league_id
+    out["season"] = season
+    out["ou25_market"] = ou25_market
+    out["btts_market"] = btts_market
+    out["recent_form_home"] = recent_home
+    out["recent_form_away"] = recent_away
+    out["season_stats_home"] = season_home
+    out["season_stats_away"] = season_away
+    out["injuries_home"] = injuries_home
+    out["injuries_away"] = injuries_away
+    out["lineup_home"] = lineup_home
+    out["lineup_away"] = lineup_away
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 def _to_float(x: Any) -> Optional[float]:
@@ -323,4 +571,8 @@ __all__ = [
     "get_team_position",
     "get_recent_goals",
     "get_team_form_and_goals",
+    "get_team_recent_block",
+    "get_team_season_context",
+    "get_fixture_lineups",
+    "enrich_fixture",
 ]
