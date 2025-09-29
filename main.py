@@ -14,14 +14,20 @@ logging.basicConfig(
 )
 
 # ----------------------------
-# Repo modules (present in your codebase)
+# Repo modules already in your project
 # ----------------------------
 from utils.get_football_data import fetch_fixtures, get_head_to_head
 from utils.cached_football_data import get_match_odds
 from utils.insert_match import insert_match
 from utils.insert_value_predictions import insert_value_predictions
 from utils.get_prediction import get_prediction
-from utils.value_inversion import invert_ou25_prediction
+
+# Optional: inverter present, but we’ll guard it behind an env flag
+try:
+    from utils.value_inversion import invert_ou25_prediction
+    _HAS_INVERTER = True
+except Exception:
+    _HAS_INVERTER = False
 
 # Optional result settlement (will be skipped if the module isn't present)
 try:
@@ -33,15 +39,18 @@ except Exception as _e:
 
 
 # ----------------------------
+# Config
+# ----------------------------
+ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
+INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
 def _today_str_brussels() -> str:
-    """
-    Return today's date string (YYYY-MM-DD) in Europe/Brussels.
-    Uses Python's zoneinfo if available; falls back to localtime.
-    """
     try:
-        from zoneinfo import ZoneInfo  # Python 3.9+
+        from zoneinfo import ZoneInfo
         now_bru = datetime.now(ZoneInfo("Europe/Brussels"))
     except Exception:
         now_bru = datetime.now()
@@ -104,8 +113,28 @@ def _build_match_payload_from_fixture(
     return payload
 
 
-def _process_fixture(fx: Dict[str, Any], *, odds_source: str = "apifootball") -> None:
-    """Process a single fixture end-to-end (insert match, predict, invert, store)."""
+def _maybe_invert(pred: Dict[str, Any], odds_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Only invert if INVERT_PREDICTIONS=true and inverter is available.
+    Otherwise return the original (TRUE) prediction unchanged.
+    """
+    if not INVERT_PREDICTIONS:
+        logging.info("Inversion disabled: posting TRUE model prediction.")
+        return pred
+    if not _HAS_INVERTER:
+        logging.warning("Inversion requested but utils.value_inversion is missing. Posting TRUE prediction.")
+        return pred
+    try:
+        flipped = invert_ou25_prediction(dict(pred), odds_raw=odds_raw, src=ODDS_SOURCE)
+        logging.info("Inversion enabled: posting INVERTED prediction.")
+        return flipped
+    except Exception as e:
+        logging.warning(f"Inversion failed ({e}); posting TRUE prediction.")
+        return pred
+
+
+def _process_fixture(fx: Dict[str, Any]) -> None:
+    """Process a single fixture end-to-end (insert match, predict, optional invert, store)."""
     fixture_id = (fx.get("fixture") or {}).get("id")
     if not fixture_id:
         logging.warning("Skipping fixture without fixture_id.")
@@ -135,7 +164,7 @@ def _process_fixture(fx: Dict[str, Any], *, odds_source: str = "apifootball") ->
     except Exception:
         h2h = []
 
-    payload = _build_match_payload_from_fixture(fx, odds_source, odds_raw)
+    payload = _build_match_payload_from_fixture(fx, ODDS_SOURCE, odds_raw)
     payload["head_to_head"] = h2h
 
     # Need an Over 2.5 price for predictor; if missing, skip prediction for this fixture
@@ -143,7 +172,7 @@ def _process_fixture(fx: Dict[str, Any], *, odds_source: str = "apifootball") ->
         logging.info(f"ℹ️ No Over 2.5 price for fixture {fixture_id}; skipping prediction.")
         return
 
-    # 4) Run your predictor
+    # 4) Run your predictor (true model output)
     try:
         pred = get_prediction(payload) or {}
     except Exception as e:
@@ -159,19 +188,16 @@ def _process_fixture(fx: Dict[str, Any], *, odds_source: str = "apifootball") ->
     pred.setdefault("fixture_id", fixture_id)
     pred.setdefault("market", "over_2_5")
 
-    # 5) Invert the pick (and swap to counterpart odds when available)
-    try:
-        pred = invert_ou25_prediction(pred, odds_raw=odds_raw, src=odds_source)
-    except Exception as e:
-        logging.warning(f"⚠️ Inversion failed for fixture {fixture_id}: {e}")
+    # 5) Optionally invert (now DISABLED by default)
+    final_pred = _maybe_invert(pred, odds_raw)
 
-    # 6) Store value prediction
+    # 6) Store prediction
     try:
-        count, msg = insert_value_predictions(pred, odds_source=odds_source)
+        count, msg = insert_value_predictions(final_pred, odds_source=ODDS_SOURCE)
         if count:
             logging.info(
-                f"✅ Stored inverted value prediction {fixture_id}: "
-                f"{pred.get('prediction')} @ {pred.get('odds')} | {msg}"
+                f"✅ Stored prediction {fixture_id}: "
+                f"{final_pred.get('prediction')} @ {final_pred.get('odds')} | {msg}"
             )
         else:
             logging.info(f"⛔ Skipped {fixture_id}: {msg}")
@@ -179,7 +205,7 @@ def _process_fixture(fx: Dict[str, Any], *, odds_source: str = "apifootball") ->
         logging.error(f"❌ insert_value_predictions failed for fixture {fixture_id}: {e}")
 
 
-def _process_fixtures_for_date(date_str: str, *, odds_source: str = "apifootball") -> None:
+def _process_fixtures_for_date(date_str: str) -> None:
     """Fetch all fixtures for date_str and process them."""
     try:
         fixtures: List[Dict[str, Any]] = fetch_fixtures(date_str) or []
@@ -193,7 +219,7 @@ def _process_fixtures_for_date(date_str: str, *, odds_source: str = "apifootball
 
     for fx in fixtures:
         try:
-            _process_fixture(fx, odds_source=odds_source)
+            _process_fixture(fx)
         except Exception as e:
             fid = (fx.get("fixture") or {}).get("id")
             logging.error(f"❌ Unhandled error on fixture {fid}: {e}")
@@ -225,18 +251,17 @@ def _fetch_single_fixture_stub(fixture_id: int) -> Dict[str, Any]:
 # Entrypoint
 # ----------------------------
 if __name__ == "__main__":
-    odds_src = os.getenv("ODDS_SOURCE", "apifootball")
     argv_ids = _parse_fixture_ids_from_argv(sys.argv[1:])
 
     if argv_ids:
         # Process explicit fixture IDs
         for fid in argv_ids:
             fx = _fetch_single_fixture_stub(fid)
-            _process_fixture(fx, odds_source=odds_src)
+            _process_fixture(fx)
     else:
         # Default: process today's fixtures (Europe/Brussels)
         today_str = _today_str_brussels()
-        _process_fixtures_for_date(today_str, odds_source=odds_src)
+        _process_fixtures_for_date(today_str)
 
     # --- Result settlement (today & yesterday, Europe/Brussels) ---
     if _HAS_SETTLER:
@@ -251,20 +276,3 @@ if __name__ == "__main__":
             logging.warning(f"Result settlement failed: {e}")
     else:
         logging.info("Result settlement skipped (module not available).")
-        # --- Result settlement (today & yesterday, Europe/Brussels) ---
-try:
-    from utils.settle_results import settle_date
-    from zoneinfo import ZoneInfo
-    from datetime import datetime, timedelta
-
-    now_bru = datetime.now(ZoneInfo("Europe/Brussels"))
-    today_ds = now_bru.strftime("%Y-%m-%d")
-    yday_ds  = (now_bru - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    settled_today = settle_date(today_ds)
-    settled_yday  = settle_date(yday_ds)
-    logging.info(f"✅ Settled {settled_today} results for {today_ds}")
-    logging.info(f"✅ Settled {settled_yday} results for {yday_ds}")
-except Exception as e:
-    logging.warning(f"Result settlement skipped/failed: {e}")
-
