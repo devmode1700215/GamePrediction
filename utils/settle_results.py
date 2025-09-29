@@ -12,7 +12,7 @@ SB_URL = os.getenv("SUPABASE_URL")
 SB_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 VP_TABLE = os.getenv("VALUE_PREDICTIONS_TABLE", "value_predictions")
 VER_TABLE = os.getenv("VERIFICATIONS_TABLE", "verifications")
-MARKET = os.getenv("MARKET_NAME", "over_2_5")  # we settle OU2.5
+MARKET = os.getenv("MARKET_NAME", "over_2_5")  # settle OU2.5
 
 if not SB_URL or not SB_KEY:
     raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/ANON_KEY")
@@ -38,18 +38,21 @@ def _pg_get(path: str, params: Dict[str, Any]) -> requests.Response:
     return requests.get(f"{SB_URL.rstrip('/')}{path}", headers=HDRS, params=params, timeout=25)
 
 
-def _verifications_upsert(prediction_id: str, is_correct: Optional[bool]) -> bool:
+def _verifications_upsert(payload_row: Dict[str, Any]) -> bool:
     """
-    Proper upsert into verifications with PK on prediction_id.
+    Proper UPSERT into verifications (PK: prediction_id).
+    Payload should include prediction_id and any extra columns we added via SQL.
     """
-    if not prediction_id:
-        return False
     params = {"on_conflict": "prediction_id"}
     headers = dict(HDRS)
     headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-    payload = [{"prediction_id": prediction_id, "is_correct": is_correct}]
-    r = requests.post(f"{SB_URL.rstrip('/')}/rest/v1/{VER_TABLE}",
-                      headers=headers, params=params, data=json.dumps(payload), timeout=25)
+    r = requests.post(
+        f"{SB_URL.rstrip('/')}/rest/v1/{VER_TABLE}",
+        headers=headers,
+        params=params,
+        data=json.dumps([payload_row]),
+        timeout=25,
+    )
     if r.status_code >= 400:
         logging.error(f"[settle] UPSERT {VER_TABLE} failed: {r.status_code} {r.text}")
         return False
@@ -59,7 +62,6 @@ def _verifications_upsert(prediction_id: str, is_correct: Optional[bool]) -> boo
 def _get_latest_prediction_row(fixture_id: int, market: str = MARKET) -> Optional[Dict[str, Any]]:
     """
     Fetch latest value_prediction for fixture+market.
-    We order by created_at desc if present; otherwise rely on default.
     """
     params = {
         "fixture_id": f"eq.{fixture_id}",
@@ -79,6 +81,13 @@ def _get_latest_prediction_row(fixture_id: int, market: str = MARKET) -> Optiona
 def _is_finished(fx: Dict[str, Any]) -> bool:
     status = (((fx or {}).get("fixture") or {}).get("status") or {}).get("short")
     return status in {"FT", "AET", "PEN"}
+
+
+def _teams(fx: Dict[str, Any]) -> (Optional[str], Optional[str]):
+    teams = (fx or {}).get("teams") or {}
+    h = (teams.get("home") or {}).get("name")
+    a = (teams.get("away") or {}).get("name")
+    return (h, a)
 
 
 def _total_goals(fx: Dict[str, Any]) -> Optional[int]:
@@ -103,10 +112,10 @@ def _result_side_from_total(total: Optional[int]) -> Optional[str]:
 
 def settle_date(date_str: str) -> int:
     """
-    Settle all finished fixtures for a given YYYY-MM-DD date.
-    Writes/updates verifications rows; no longer patches value_predictions columns
-    that are not in your schema.
-    Returns count of verifications written/updated.
+    Settle all finished fixtures for the given YYYY-MM-DD date.
+    Writes/updates verifications rows with: prediction_id (PK), is_correct, fixture_id,
+    home_team, away_team, result_goals, result_side, settled_at.
+    Returns: count of verifications written/updated.
     """
     try:
         fixtures: List[Dict[str, Any]] = fetch_fixtures(date_str) or []
@@ -120,7 +129,8 @@ def settle_date(date_str: str) -> int:
             if not _is_finished(fx):
                 continue
 
-            fixture_id = ((fx.get("fixture") or {}).get("id"))
+            fixture = (fx.get("fixture") or {})
+            fixture_id = fixture.get("id")
             if not fixture_id:
                 continue
 
@@ -130,19 +140,33 @@ def settle_date(date_str: str) -> int:
                 logging.info(f"[settle] Fixture {fixture_id} finished but no total goals found; skipping.")
                 continue
 
+            home_name, away_name = _teams(fx)
+
             vp = _get_latest_prediction_row(fixture_id, MARKET)
             if not vp:
-                # no prediction saved for this fixture/market
+                # No stored prediction for this fixture/market
                 continue
 
             pick = (vp.get("prediction") or "").strip()
             pred_id = vp.get("id")
             won = (pick == side)
 
-            # Authoritative correctness record (UPSERT)
-            if pred_id and _verifications_upsert(pred_id, won):
+            payload = {
+                "prediction_id": pred_id,
+                "is_correct": won,
+                "fixture_id": fixture_id,
+                "home_team": home_name,
+                "away_team": away_name,
+                "result_goals": total,
+                "result_side": side,
+                "settled_at": _now_iso(),
+            }
+
+            if pred_id and _verifications_upsert(payload):
                 updated += 1
-                logging.info(f"[settle] ✅ Fixture {fixture_id}: total={total} side={side} pick={pick} won={won}")
+                logging.info(
+                    f"[settle] ✅ {home_name} vs {away_name} (#{fixture_id}): total={total} side={side} pick={pick} won={won}"
+                )
 
         except Exception as e:
             logging.error(f"[settle] error: {e}")
