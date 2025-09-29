@@ -7,12 +7,11 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-# --- ENV / REST setup ---
 SB_URL = os.getenv("SUPABASE_URL")
 SB_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 VP_TABLE = os.getenv("VALUE_PREDICTIONS_TABLE", "value_predictions")
 VER_TABLE = os.getenv("VERIFICATIONS_TABLE", "verifications")
-MARKET = os.getenv("MARKET_NAME", "over_2_5")  # settle OU2.5
+MARKET = os.getenv("MARKET_NAME", "over_2_5")  # settle OU 2.5
 
 if not SB_URL or not SB_KEY:
     raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/ANON_KEY")
@@ -39,10 +38,6 @@ def _pg_get(path: str, params: Dict[str, Any]) -> requests.Response:
 
 
 def _verifications_upsert(payload_row: Dict[str, Any]) -> bool:
-    """
-    Proper UPSERT into verifications (PK: prediction_id).
-    Payload should include prediction_id and any extra columns we added via SQL.
-    """
     params = {"on_conflict": "prediction_id"}
     headers = dict(HDRS)
     headers["Prefer"] = "resolution=merge-duplicates,return=representation"
@@ -60,9 +55,6 @@ def _verifications_upsert(payload_row: Dict[str, Any]) -> bool:
 
 
 def _get_latest_prediction_row(fixture_id: int, market: str = MARKET) -> Optional[Dict[str, Any]]:
-    """
-    Fetch latest value_prediction for fixture+market.
-    """
     params = {
         "fixture_id": f"eq.{fixture_id}",
         "market": f"eq.{market}",
@@ -83,25 +75,21 @@ def _is_finished(fx: Dict[str, Any]) -> bool:
     return status in {"FT", "AET", "PEN"}
 
 
-def _teams(fx: Dict[str, Any]) -> (Optional[str], Optional[str]):
-    teams = (fx or {}).get("teams") or {}
-    h = (teams.get("home") or {}).get("name")
-    a = (teams.get("away") or {}).get("name")
-    return (h, a)
-
-
-def _total_goals(fx: Dict[str, Any]) -> Optional[int]:
+def _goals_home_away(fx: Dict[str, Any]) -> Optional[tuple[int, int]]:
     goals = (fx or {}).get("goals") or {}
     try:
-        return int(goals.get("home") or 0) + int(goals.get("away") or 0)
+        gh = int(goals.get("home") or 0)
+        ga = int(goals.get("away") or 0)
+        return gh, ga
     except Exception:
-        pass
-    score = (fx or {}).get("score") or {}
-    ft = score.get("fulltime") or {}
-    try:
-        return int(ft.get("home") or 0) + int(ft.get("away") or 0)
-    except Exception:
-        return None
+        score = (fx or {}).get("score") or {}
+        ft = score.get("fulltime") or {}
+        try:
+            gh = int(ft.get("home") or 0)
+            ga = int(ft.get("away") or 0)
+            return gh, ga
+        except Exception:
+            return None
 
 
 def _result_side_from_total(total: Optional[int]) -> Optional[str]:
@@ -110,12 +98,18 @@ def _result_side_from_total(total: Optional[int]) -> Optional[str]:
     return "Over" if total > 2 else "Under"  # OU 2.5 threshold
 
 
+def _teams(fx: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    teams = (fx or {}).get("teams") or {}
+    return ( (teams.get("home") or {}).get("name"),
+             (teams.get("away") or {}).get("name") )
+
+
 def settle_date(date_str: str) -> int:
     """
     Settle all finished fixtures for the given YYYY-MM-DD date.
-    Writes/updates verifications rows with: prediction_id (PK), is_correct, fixture_id,
-    home_team, away_team, result_goals, result_side, settled_at.
-    Returns: count of verifications written/updated.
+    Writes/updates verifications with:
+      prediction_id (PK), is_correct, fixture_id, home_team, away_team,
+      goals_home, goals_away, result_goals, result_side, settled_at.
     """
     try:
         fixtures: List[Dict[str, Any]] = fetch_fixtures(date_str) or []
@@ -129,22 +123,21 @@ def settle_date(date_str: str) -> int:
             if not _is_finished(fx):
                 continue
 
-            fixture = (fx.get("fixture") or {})
-            fixture_id = fixture.get("id")
+            fixture_id = ((fx.get("fixture") or {}).get("id"))
             if not fixture_id:
                 continue
 
-            total = _total_goals(fx)
-            side = _result_side_from_total(total)
-            if side is None:
-                logging.info(f"[settle] Fixture {fixture_id} finished but no total goals found; skipping.")
+            ghga = _goals_home_away(fx)
+            if not ghga:
+                logging.info(f"[settle] Fixture {fixture_id} finished but no goals found; skipping.")
                 continue
+            gh, ga = ghga
+            total = gh + ga
+            side = _result_side_from_total(total)
 
             home_name, away_name = _teams(fx)
-
             vp = _get_latest_prediction_row(fixture_id, MARKET)
             if not vp:
-                # No stored prediction for this fixture/market
                 continue
 
             pick = (vp.get("prediction") or "").strip()
@@ -157,6 +150,8 @@ def settle_date(date_str: str) -> int:
                 "fixture_id": fixture_id,
                 "home_team": home_name,
                 "away_team": away_name,
+                "goals_home": gh,
+                "goals_away": ga,
                 "result_goals": total,
                 "result_side": side,
                 "settled_at": _now_iso(),
@@ -165,7 +160,7 @@ def settle_date(date_str: str) -> int:
             if pred_id and _verifications_upsert(payload):
                 updated += 1
                 logging.info(
-                    f"[settle] ✅ {home_name} vs {away_name} (#{fixture_id}): total={total} side={side} pick={pick} won={won}"
+                    f"[settle] ✅ {home_name} {gh}-{ga} {away_name} (#{fixture_id}) | side={side} pick={pick} won={won}"
                 )
 
         except Exception as e:
