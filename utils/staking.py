@@ -47,7 +47,7 @@ def compute_stake_pct(pred: Dict[str, Any]) -> float:
 
     # ---- Environment knobs ----
     KELLY_SCALER   = float(os.getenv("KELLY_SCALER", "0.5"))     # 0..1, default half-Kelly
-    MAX_STAKE_PCT  = float(os.getenv("MAX_STAKE_PCT", "0.02"))   # cap (default 2% bankroll)
+    MAX_STAKE_PCT  = float(os.getenv("MAX_STAKE_PCT", "0.04"))   # cap (default 2% bankroll)
     EDGE_FLOOR     = float(os.getenv("EDGE_FLOOR", "0.01"))      # 1 pp edge gets full factor
     SOURCE_QUALITY_OT = float(os.getenv("SOURCE_QUALITY_OVERTIME", "1.0"))
     SOURCE_QUALITY_DEF = float(os.getenv("SOURCE_QUALITY_DEFAULT", "0.90"))
