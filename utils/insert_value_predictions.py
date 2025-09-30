@@ -1,20 +1,15 @@
 # utils/insert_value_predictions.py
 from __future__ import annotations
 from typing import Any, Dict, Tuple, Optional
-
 from utils.supa import postgrest_upsert
 
 def _to_float(x) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
+    try: return float(x)
+    except Exception: return None
 
 def _clip(x: Optional[float], lo: float, hi: float) -> Optional[float]:
-    try:
-        return max(lo, min(hi, float(x))) if x is not None else None
-    except Exception:
-        return None
+    try: return max(lo, min(hi, float(x))) if x is not None else None
+    except Exception: return None
 
 def _derive_confidence(pred: Dict[str, Any]) -> float:
     pick = pred.get("prediction")
@@ -38,8 +33,8 @@ def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -
     confidence = _derive_confidence(pred)
     odds = _to_float(pred.get("odds"))
     edge = _to_float(pred.get("edge"))
+    stake_pct = _to_float(pred.get("stake_pct")) or 0.0  # <- use computed stake
 
-    # Rationale: store NULL if empty
     rationale = pred.get("rationale")
     if isinstance(rationale, list):
         rationale = " • ".join([str(x) for x in rationale[:6]])
@@ -56,7 +51,7 @@ def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -
         "prediction": prediction,
         "confidence_pct": round(confidence, 4),
         "po_value": (edge is not None and edge > 0.0),
-        "stake_pct": 0.0,  # staking handled elsewhere
+        "stake_pct": round(stake_pct, 4),  # <- store it
         "odds": odds,
         "rationale": rationale,
         "edge": round(edge, 4) if edge is not None else None,
@@ -66,7 +61,6 @@ def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -
 
     resp = postgrest_upsert("value_predictions", [row], on_conflict="fixture_id,market")
 
-    # count from .data if present; else from status
     data = getattr(resp, "data", None)
     if isinstance(data, list):
         return (len(data), "upserted")
