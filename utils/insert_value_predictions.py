@@ -1,71 +1,69 @@
 # utils/insert_value_predictions.py
-import os
-from datetime import datetime, timezone
-from typing import Tuple, Optional
-from utils.supabaseClient import supabase
-
-ODDS_MIN = float(os.getenv("ODDS_MIN", "1.7"))
-ODDS_MAX = float(os.getenv("ODDS_MAX", "2.3"))
-CONF_MIN = float(os.getenv("CONF_MIN", "50"))      # ← default lowered to 50
-EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))
+from typing import Any, Dict, Tuple, Optional
+from utils.supa import postgrest_upsert
 
 def _to_float(x) -> Optional[float]:
-    try: return float(x)
-    except (TypeError, ValueError): return None
-
-def _nz(v, default=0.0):
-    f = _to_float(v)
-    return f if f is not None else default
-
-def insert_value_predictions(pred: dict, *, odds_source: str = "apifootball") -> Tuple[int, str]:
     try:
-        market = pred.get("market")
-        if market not in ("over_2_5", "btts"):
-            return 0, f"UNSUPPORTED_MARKET:{market}"
+        return float(x)
+    except Exception:
+        return None
 
-        fixture_id   = pred.get("fixture_id")
-        pick         = pred.get("prediction")
-        confidence   = _to_float(pred.get("confidence_pct"))
-        edge         = _to_float(pred.get("edge"))
-        po_value     = bool(pred.get("po_value"))
-        stake_pct    = _to_float(pred.get("stake_pct"))
-        odds         = _to_float(pred.get("odds"))
-        rationale    = pred.get("rationale")
+def _clip(x: Optional[float], lo: float, hi: float) -> Optional[float]:
+    try:
+        return max(lo, min(hi, float(x))) if x is not None else None
+    except Exception:
+        return None
 
-        # Gates
-        if odds is None:
-            return 0, "NO_ODDS"
-        if not (ODDS_MIN <= odds <= ODDS_MAX):
-            return 0, f"ODDS_OUT_OF_RANGE:{odds}"
-        if confidence is None or confidence < CONF_MIN:
-            return 0, f"CONFIDENCE_BELOW_MIN:{confidence}"
-        if edge is None or edge < EDGE_MIN:
-            return 0, f"EDGE_BELOW_MIN:{edge}"
-        if not po_value:
-            return 0, "PO_VALUE_FALSE"
-        if stake_pct is None or stake_pct <= 0:
-            return 0, f"STAKE_PCT_INVALID:{stake_pct}"
+def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -> Tuple[int, str]:
+    """
+    Expects:
+      fixture_id:int, market:str ('over_2_5'), prediction:'Over'|'Under',
+      confidence:float (0..1), odds:float|None, edge:float|None, rationale:list[str]|str
+    Upsert key: (fixture_id, market)
+    """
+    fixture_id = pred.get("fixture_id")
+    market = pred.get("market") or "over_2_5"
+    if fixture_id is None or not market:
+        return (0, "missing fixture_id/market")
 
-        row = {
-            "fixture_id": fixture_id,
-            "market": market,
-            "prediction": pick,
-            "confidence_pct": _nz(confidence),
-            "po_value": True,
-            "stake_pct": _nz(stake_pct),
-            "odds": _nz(odds),
-            "rationale": rationale,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "edge": _nz(edge),
-            "is_overtime_odds": (odds_source == "overtime"),
-            "odds_source": odds_source,
-        }
+    prediction = pred.get("prediction")
+    if prediction not in ("Over", "Under"):
+        prediction = "Over"
 
-        res = (
-            supabase.table("value_predictions")
-            .upsert(row, on_conflict="fixture_id,market")
-            .execute()
-        )
-        return 1, "OK"
-    except Exception as e:
-        return 0, f"HTTP_EXCEPTION:{e}"
+    conf = _to_float(pred.get("confidence"))
+    prob_over = _to_float(pred.get("prob_over"))
+    if conf is None:
+        if prob_over is not None:
+            conf = prob_over if prediction == "Over" else (1.0 - prob_over)
+    conf = _clip(conf, 0.05, 0.99)
+    if conf is None:
+        conf = 0.50  # final fallback
+
+    odds = _to_float(pred.get("odds"))
+    edge = _to_float(pred.get("edge"))
+
+    rationale = pred.get("rationale")
+    if isinstance(rationale, list):
+        rationale = " • ".join([str(x) for x in rationale[:6]])
+    elif rationale is not None:
+        rationale = str(rationale)
+
+    signals = pred.get("signals")
+    # Optional: you can persist signals in rationale tail if you like (kept simple here)
+
+    row = {
+        "fixture_id": fixture_id,
+        "market": market,
+        "prediction": prediction,
+        "confidence_pct": round(conf, 4),
+        "po_value": (edge is not None and edge > 0.0),
+        "stake_pct": 0.0,  # your staking module can update later if needed
+        "odds": odds,
+        "rationale": rationale,
+        "edge": round(edge, 4) if edge is not None else None,
+        "is_overtime_odds": False,
+        "odds_source": odds_source,
+    }
+
+    recs = postgrest_upsert("value_predictions", [row], on_conflict="fixture_id,market")
+    return (len(recs), "upserted")
