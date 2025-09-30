@@ -17,6 +17,7 @@ ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
 PREFERRED_BOOK = os.getenv("PREF_BOOK", "Bwin")
 INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
 SCORING_DEBUG = os.getenv("SCORING_DEBUG", "true").lower() in ("1", "true", "yes", "y")
+LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "2"))  # today + N days ahead
 
 # --------------------------------------------------------------------
 # Repo utils
@@ -30,6 +31,7 @@ from utils.get_football_data import (
 from utils.insert_match import insert_match
 from utils.insert_value_predictions import insert_value_predictions
 from utils.get_prediction import get_prediction
+from utils.safe_get import safe_get  # used for Overtime queries
 
 # Optional inverter
 try:
@@ -69,7 +71,27 @@ def _date_str_brussels_days_ago(days: int) -> str:
     return target.strftime("%Y-%m-%d")
 
 
-def _choose_ou_odds(fx: Dict[str, Any], fixture_id: int) -> Dict[str, Optional[float]]:
+def _date_str_brussels_days_ahead(days: int) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        base = datetime.now(ZoneInfo("Europe/Brussels"))
+    except Exception:
+        base = datetime.now()
+    target = base + timedelta(days=days)
+    return target.strftime("%Y-%m-%d")
+
+
+def _clip(x: Optional[float], lo: float, hi: float) -> Optional[float]:
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Odds helpers
+# ----------------------------
+def _choose_ou_odds_from_enriched_or_api(fx: Dict[str, Any], fixture_id: int) -> Dict[str, Optional[float]]:
     """
     Return {'over_2_5': float|None, 'under_2_5': float|None} using:
       1) enriched 'ou25_market' if present
@@ -82,6 +104,112 @@ def _choose_ou_odds(fx: Dict[str, Any], fixture_id: int) -> Dict[str, Optional[f
         return {"over_2_5": over_, "under_2_5": under_}
     odds_flat = get_match_odds(fixture_id) or {}
     return {"over_2_5": odds_flat.get("over_2_5"), "under_2_5": odds_flat.get("under_2_5")}
+
+def _to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _slugify(s: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "-" for ch in (s or "").strip()).strip("-")
+
+def _fetch_overtime_candidates(date_iso: str, home_name: str, away_name: str) -> List[Dict[str, Any]]:
+    """
+    Minimal Overtime search by date + names (no mapping yet).
+    Expected API (adjust as needed):
+      GET {OVERTIME_BASE_URL}/odds/search?date=YYYY-MM-DD&home=..&away=..&market=ou25
+    Returns a list of candidate matches; we'll do a naive name check.
+    """
+    base = os.getenv("OVERTIME_BASE_URL")
+    key  = os.getenv("OVERTIME_API_KEY")
+    if not base or not key:
+        return []
+    url = f"{base.rstrip('/')}/odds/search"
+    headers = {"Authorization": f"Bearer {key}"}
+    params  = {"date": date_iso, "home": home_name, "away": away_name, "market": "ou25"}
+    resp = safe_get(url, headers=headers, params=params)
+    if resp is None:
+        logging.info("[overtime] no response for %s %s vs %s", date_iso, home_name, away_name)
+        return []
+    try:
+        data = resp.json() or {}
+        items = data.get("results") or data.get("matches") or data.get("data") or []
+        if not isinstance(items, list):
+            logging.info("[overtime] unexpected payload shape for %s", url)
+            return []
+        logging.info("[overtime] %d candidates for %s %s vs %s", len(items), date_iso, home_name, away_name)
+        return items
+    except Exception as e:
+        logging.warning(f"[overtime] parse error: {e}")
+        return []
+
+def _extract_ou25_from_overtime_item(item: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Try multiple shapes to extract OU2.5 from a candidate item.
+    Accepted shapes:
+      item["markets"]["over_2_5"], ["markets"]["under_2_5"]
+      item["ou25"]["over"], item["ou25"]["under"]
+      item["over_2_5"], item["under_2_5"]
+    """
+    markets = item.get("markets") or {}
+    if isinstance(markets, dict):
+        over_ = _to_float(markets.get("over_2_5"))
+        under_ = _to_float(markets.get("under_2_5"))
+        if over_ is not None or under_ is not None:
+            return {"over_2_5": over_, "under_2_5": under_}
+
+    ou25 = item.get("ou25") or {}
+    if isinstance(ou25, dict):
+        over_ = _to_float(ou25.get("over"))
+        under_ = _to_float(ou25.get("under"))
+        if over_ is not None or under_ is not None:
+            return {"over_2_5": over_, "under_2_5": under_}
+
+    over_ = _to_float(item.get("over_2_5"))
+    under_ = _to_float(item.get("under_2_5"))
+    return {"over_2_5": over_, "under_2_5": under_}
+
+def _get_best_ou25_odds_overtime_first(fx_enriched: Dict[str, Any], preferred_bookmaker: str = "Bwin") -> Dict[str, Any]:
+    """
+    STEP 1: Try Overtime by date+names (naive matching).
+    If nothing found/parsed, fall back to API-Football.
+    """
+    fixture = fx_enriched.get("fixture", {}) or {}
+    teams = fx_enriched.get("teams", {}) or {}
+    home = teams.get("home", {}) or {}
+    away = teams.get("away", {}) or {}
+
+    date_iso = (fixture.get("date") or "")[:10]
+    af_home = home.get("name") or ""
+    af_away = away.get("name") or ""
+    s_home, s_away = _slugify(af_home), _slugify(af_away)
+
+    # 1) Overtime: simple search
+    candidates = _fetch_overtime_candidates(date_iso, af_home, af_away)
+    chosen = None
+    for it in candidates:
+        # naive name check (we'll add proper mapping later)
+        ot_home = _slugify(it.get("home") or it.get("home_name") or "")
+        ot_away = _slugify(it.get("away") or it.get("away_name") or "")
+        if not ot_home or not ot_away:
+            continue
+        # accept if both names roughly match (contains or equal)
+        if (s_home in ot_home or ot_home in s_home) and (s_away in ot_away or ot_away in s_away):
+            chosen = it
+            break
+
+    if chosen:
+        ou = _extract_ou25_from_overtime_item(chosen)
+        if ou.get("over_2_5") is not None or ou.get("under_2_5") is not None:
+            return {"over_2_5": ou.get("over_2_5"), "under_2_5": ou.get("under_2_5"),
+                    "source": "overtime", "is_overtime_odds": True}
+
+    # 2) Fallback: enriched/API-Football odds
+    fid = fixture.get("id")
+    flat = _choose_ou_odds_from_enriched_or_api(fx_enriched, fid)
+    return {"over_2_5": flat.get("over_2_5"), "under_2_5": flat.get("under_2_5"),
+            "source": "apifootball", "is_overtime_odds": False}
 
 
 def _build_llm_payload_from_enriched(
@@ -109,9 +237,7 @@ def _build_llm_payload_from_enriched(
     except Exception:
         h2h = []
 
-    # Odds
-    ou = _choose_ou_odds(fx_enriched, fixture_id)
-
+    # NOTE: odds overridden later with chosen source
     payload = {
         "fixture_id": fixture_id,
         "date": fixture.get("date"),
@@ -126,37 +252,14 @@ def _build_llm_payload_from_enriched(
             "name": venue.get("name"),
             "city": venue.get("city"),
         },
-        "home_team": {
-            "id": home.get("id"),
-            "name": home.get("name"),
-        },
-        "away_team": {
-            "id": away.get("id"),
-            "name": away.get("name"),
-        },
+        "home_team": {"id": home.get("id"), "name": home.get("name")},
+        "away_team": {"id": away.get("id"), "name": away.get("name")},
         "head_to_head": h2h,
-        "odds": {
-            "over_2_5": ou.get("over_2_5"),
-            "under_2_5": ou.get("under_2_5"),
-            "source": odds_src,
-        },
-        # Rich blocks for the scorer:
-        "recent_form": {
-            "home": fx_enriched.get("recent_form_home"),
-            "away": fx_enriched.get("recent_form_away"),
-        },
-        "season_context": {
-            "home": fx_enriched.get("season_stats_home"),
-            "away": fx_enriched.get("season_stats_away"),
-        },
-        "injuries": {
-            "home": fx_enriched.get("injuries_home"),
-            "away": fx_enriched.get("injuries_away"),
-        },
-        "lineups": {
-            "home": fx_enriched.get("lineup_home"),
-            "away": fx_enriched.get("lineup_away"),
-        },
+        "odds": {"over_2_5": None, "under_2_5": None, "source": odds_src},
+        "recent_form": {"home": fx_enriched.get("recent_form_home"), "away": fx_enriched.get("recent_form_away")},
+        "season_context": {"home": fx_enriched.get("season_stats_home"), "away": fx_enriched.get("season_stats_away")},
+        "injuries": {"home": fx_enriched.get("injuries_home"), "away": fx_enriched.get("injuries_away")},
+        "lineups": {"home": fx_enriched.get("lineup_home"), "away": fx_enriched.get("lineup_away")},
     }
     return payload
 
@@ -177,17 +280,7 @@ def _maybe_invert(pred: Dict[str, Any], odds_raw: Dict[str, Any]) -> Dict[str, A
         return pred
 
 
-def _clip(x: Optional[float], lo: float, hi: float) -> Optional[float]:
-    try:
-        return max(lo, min(hi, float(x)))
-    except Exception:
-        return None
-
-
 def _normalize_prediction(pred: Dict[str, Any], payload_odds: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure prediction fields are present/sane to avoid skips on None.
-    """
     out = dict(pred)
     pick = out.get("prediction")
     if pick not in ("Over", "Under"):
@@ -268,10 +361,18 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     except Exception as e:
         logging.error(f"❌ insert_match failed for fixture {fixture_id}: {e}")
 
-    # 3) Build payload with odds
-    payload = _build_llm_payload_from_enriched(fx_enriched, ODDS_SOURCE)
+    # 3) Choose odds: Overtime first (by date+names), else API-Football
+    odds_block = _get_best_ou25_odds_overtime_first(fx_enriched, preferred_bookmaker=PREFERRED_BOOK)
 
-    # Proceed unless BOTH sides are missing (we can still work with one side)
+    # Build payload with chosen odds
+    payload = _build_llm_payload_from_enriched(fx_enriched, odds_block.get("source") or ODDS_SOURCE)
+    payload["odds"] = {
+        "over_2_5": odds_block.get("over_2_5"),
+        "under_2_5": odds_block.get("under_2_5"),
+        "source": odds_block.get("source") or ODDS_SOURCE,
+    }
+
+    # Proceed unless BOTH sides are missing
     ou = payload.get("odds") or {}
     if ou.get("over_2_5") is None and ou.get("under_2_5") is None:
         logging.info(f"ℹ️ No OU2.5 prices for fixture {fixture_id}; skipping prediction.")
@@ -291,6 +392,7 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     pred = dict(pred)
     pred.setdefault("fixture_id", fixture_id)
     pred.setdefault("market", "over_2_5")
+    pred["is_overtime_odds"] = bool(odds_block.get("is_overtime_odds"))
 
     # 5) Normalize + debug
     pred = _normalize_prediction(pred, payload.get("odds") or {})
@@ -301,11 +403,12 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
 
     # 7) Store prediction
     try:
-        count, msg = insert_value_predictions(final_pred, odds_source=ODDS_SOURCE)
+        count, msg = insert_value_predictions(final_pred, odds_source=(odds_block.get("source") or ODDS_SOURCE))
         if count:
             logging.info(
                 f"✅ Stored prediction {fixture_id}: "
-                f"{final_pred.get('prediction')} @ {final_pred.get('odds')} | conf={final_pred.get('confidence')} | {msg}"
+                f"{final_pred.get('prediction')} @ {final_pred.get('odds')} | conf={final_pred.get('confidence')} "
+                f"| src={odds_block.get('source')} | {msg}"
             )
         else:
             logging.info(f"⛔ Skipped {fixture_id}: {msg}")
@@ -369,10 +472,13 @@ if __name__ == "__main__":
             fx = _fetch_single_fixture_stub(fid)
             _process_fixture(fx)
     else:
-        today_str = _today_str_brussels()
-        _process_fixtures_for_date(today_str)
+        # Process today + N days ahead (default 2)
+        for d in range(0, LOOKAHEAD_DAYS + 1):
+            ds = _today_str_brussels() if d == 0 else _date_str_brussels_days_ahead(d)
+            logging.info(f"▶ Processing fixtures for {ds}")
+            _process_fixtures_for_date(ds)
 
-    # Settle today & yesterday
+    # Settle today & yesterday only (never settle future dates)
     if _HAS_SETTLER:
         try:
             today_ds = _today_str_brussels()
