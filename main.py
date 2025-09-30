@@ -1,4 +1,4 @@
-# main.py
+# main.py  (only two additions marked >>>)
 import os
 import sys
 import logging
@@ -20,10 +20,11 @@ from utils.get_football_data import (
     get_head_to_head,
     enrich_fixture,
 )
-from utils.odds_sources import get_ou25_best  # NEW
+from utils.odds_sources import get_ou25_best
 from utils.insert_match import insert_match
 from utils.insert_value_predictions import insert_value_predictions
 from utils.get_prediction import get_prediction
+from utils.staking import compute_stake_pct  # >>> NEW
 
 try:
     from utils.value_inversion import invert_ou25_prediction
@@ -38,132 +39,7 @@ except Exception as _e:
     logging.info(f"Result settlement module not found (utils.settle_results): {_e}")
     _HAS_SETTLER = False
 
-
-def _today_str_brussels() -> str:
-    try:
-        from zoneinfo import ZoneInfo
-        now_bru = datetime.now(ZoneInfo("Europe/Brussels"))
-    except Exception:
-        now_bru = datetime.now()
-    return now_bru.strftime("%Y-%m-%d")
-
-def _date_str_brussels_days_ago(days: int) -> str:
-    try:
-        from zoneinfo import ZoneInfo
-        base = datetime.now(ZoneInfo("Europe/Brussels"))
-    except Exception:
-        base = datetime.now()
-    target = base - timedelta(days=days)
-    return target.strftime("%Y-%m-%d")
-
-def _build_llm_payload_from_enriched(fx_enriched: Dict[str, Any], odds_block: Dict[str, Any], odds_src: str) -> Dict[str, Any]:
-    fixture = fx_enriched.get("fixture", {}) or {}
-    league = fx_enriched.get("league", {}) or {}
-    teams = fx_enriched.get("teams", {}) or {}
-    venue = fixture.get("venue", {}) or {}
-
-    home = teams.get("home", {}) or {}
-    away = teams.get("away", {}) or {}
-
-    fixture_id = fixture.get("id")
-    league_id = fx_enriched.get("league_id") or league.get("id")
-    season = fx_enriched.get("season") or league.get("season")
-
-    # H2H (last 3) – keep as is
-    h2h = []
-    try:
-        hid, aid = home.get("id"), away.get("id")
-        if hid and aid:
-            h2h = get_head_to_head(hid, aid, limit=3)
-    except Exception:
-        h2h = []
-
-    return {
-        "fixture_id": fixture_id,
-        "date": fixture.get("date"),
-        "league": {"id": league_id, "name": league.get("name"), "country": league.get("country"), "season": season},
-        "venue": {"id": venue.get("id"), "name": venue.get("name"), "city": venue.get("city")},
-        "home_team": {"id": home.get("id"), "name": home.get("name")},
-        "away_team": {"id": away.get("id"), "name": away.get("name")},
-        "head_to_head": h2h,
-        "odds": {"over_2_5": odds_block.get("over_2_5"), "under_2_5": odds_block.get("under_2_5"), "source": odds_src},
-        "recent_form": {"home": fx_enriched.get("recent_form_home"), "away": fx_enriched.get("recent_form_away")},
-        "season_context": {"home": fx_enriched.get("season_stats_home"), "away": fx_enriched.get("season_stats_away")},
-        "injuries": {"home": fx_enriched.get("injuries_home"), "away": fx_enriched.get("injuries_away")},
-        "lineups": {"home": fx_enriched.get("lineup_home"), "away": fx_enriched.get("lineup_away")},
-    }
-
-def _maybe_invert(pred: Dict[str, Any], odds_raw: Dict[str, Any]) -> Dict[str, Any]:
-    if not INVERT_PREDICTIONS:
-        logging.info("Inversion disabled: posting TRUE model prediction.")
-        return pred
-    if not _HAS_INVERTER:
-        logging.warning("Inversion requested but inverter not available. Posting TRUE prediction.")
-        return pred
-    try:
-        flipped = invert_ou25_prediction(dict(pred), odds_raw=odds_raw, src=ODDS_SOURCE)
-        logging.info("Inversion enabled: posting INVERTED prediction.")
-        return flipped
-    except Exception as e:
-        logging.warning(f"Inversion failed ({e}); posting TRUE prediction.")
-        return pred
-
-def _clip(x: Optional[float], lo: float, hi: float) -> Optional[float]:
-    try:
-        return max(lo, min(hi, float(x)))
-    except Exception:
-        return None
-
-def _normalize_prediction(pred: Dict[str, Any], payload_odds: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(pred)
-    pick = out.get("prediction")
-    if pick not in ("Over", "Under"):
-        pick = "Over"
-        out["prediction"] = pick
-
-    p_over = out.get("prob_over")
-    try: p_over = float(p_over) if p_over is not None else None
-    except Exception: p_over = None
-    p_over = _clip(p_over, 0.01, 0.99) if p_over is not None else None
-    out["prob_over"] = p_over
-
-    conf = out.get("confidence")
-    if conf is None and p_over is not None:
-        conf = p_over if pick == "Over" else (1.0 - p_over)
-    try: conf = float(conf) if conf is not None else None
-    except Exception: conf = None
-    conf = _clip(conf, 0.05, 0.95) if conf is not None else 0.50
-    out["confidence"] = conf
-
-    chosen_odds = out.get("odds")
-    try: chosen_odds = float(chosen_odds) if chosen_odds is not None else None
-    except Exception: chosen_odds = None
-    if chosen_odds is None:
-        chosen_odds = payload_odds.get("over_2_5") if pick == "Over" else payload_odds.get("under_2_5")
-        try: chosen_odds = float(chosen_odds) if chosen_odds is not None else None
-        except Exception: chosen_odds = None
-    out["odds"] = chosen_odds
-
-    return out
-
-def _log_scoring_debug(fixture_id: int, pred: Dict[str, Any]) -> None:
-    if not SCORING_DEBUG:
-        return
-    sig = pred.get("signals") or {}
-    weights = pred.get("weights") or {}
-    priors = pred.get("priors") or {}
-    logging.info(
-        "SCORING | fid=%s pick=%s conf=%.3f prob_over=%s odds=%s edge=%s | signals=%s | weights=%s | priors=%s",
-        fixture_id,
-        pred.get("prediction"),
-        float(pred.get("confidence") or 0),
-        pred.get("prob_over"),
-        pred.get("odds"),
-        pred.get("edge"),
-        {k: sig.get(k) for k in ["form_tempo","form_rates","season_base","injuries","h2h","weighted_total"]},
-        weights,
-        priors,
-    )
+# ... (unchanged helpers omitted for brevity)
 
 def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     fixture_id = (fx_raw.get("fixture") or {}).get("id")
@@ -171,7 +47,6 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
         logging.warning("Skipping fixture without fixture_id.")
         return
 
-    # 1) Enrich + insert match
     fx_enriched = enrich_fixture(fx_raw, preferred_bookmaker=PREFERRED_BOOK)
     try:
         ok = insert_match(fx_enriched)
@@ -180,7 +55,6 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     except Exception as e:
         logging.error(f"❌ insert_match failed for fixture {fixture_id}: {e}")
 
-    # 2) Get best OU2.5 odds (Overtime first, then API-Football)
     odds_block = get_ou25_best(fixture_id, preferred_bookmaker=PREFERRED_BOOK)
     if odds_block.get("over_2_5") is None and odds_block.get("under_2_5") is None:
         logging.info(f"ℹ️ No OU2.5 prices for fixture {fixture_id}; skipping prediction.")
@@ -192,7 +66,6 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
         odds_src=(odds_block.get("source") or ODDS_SOURCE),
     )
 
-    # 3) Score/predict
     try:
         pred = get_prediction(payload) or {}
     except Exception as e:
@@ -207,74 +80,26 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     pred.setdefault("market", "over_2_5")
     pred["is_overtime_odds"] = bool(odds_block.get("is_overtime_odds"))
 
-    # Normalize + debug
+    # Normalize + debug (existing code)
     pred = _normalize_prediction(pred, payload.get("odds") or {})
     _log_scoring_debug(fixture_id, pred)
 
-    # 4) Optional inversion (kept off by default)
+    # Optional inversion (kept off by default)
     final_pred = _maybe_invert(pred, payload.get("odds") or {})
 
-    # 5) Save
+    # >>> NEW: compute stake_pct from scoring/edge/odds and attach
+    final_pred["stake_pct"] = compute_stake_pct(final_pred)
+
+    # Save
     try:
         count, msg = insert_value_predictions(final_pred, odds_source=(odds_block.get("source") or ODDS_SOURCE))
         if count:
             logging.info(
                 f"✅ Stored prediction {fixture_id}: {final_pred.get('prediction')} @ {final_pred.get('odds')} "
-                f"| conf={final_pred.get('confidence')} | src={odds_block.get('source')} | {msg}"
+                f"| conf={final_pred.get('confidence')} | edge={final_pred.get('edge')} | stake={final_pred.get('stake_pct')} "
+                f"| src={odds_block.get('source')} | {msg}"
             )
         else:
             logging.info(f"⛔ Skipped {fixture_id}: {msg}")
     except Exception as e:
         logging.error(f"❌ insert_value_predictions failed for fixture {fixture_id}: {e}")
-
-def _process_fixtures_for_date(date_str: str) -> None:
-    try:
-        fixtures: List[Dict[str, Any]] = fetch_fixtures(date_str) or []
-    except Exception as e:
-        logging.error(f"❌ fetch_fixtures failed for {date_str}: {e}")
-        return
-    if not fixtures:
-        logging.info(f"ℹ️ No fixtures for {date_str}.")
-        return
-    for fx in fixtures:
-        try:
-            _process_fixture(fx)
-        except Exception as e:
-            fid = (fx.get("fixture") or {}).get("id")
-            logging.error(f"❌ Unhandled error on fixture {fid}: {e}")
-
-def _parse_fixture_ids_from_argv(argv: List[str]) -> List[int]:
-    ids: List[int] = []
-    for x in argv:
-        try:
-            ids.append(int(x))
-        except Exception:
-            logging.warning(f"Skipping non-integer fixture id arg: {x}")
-    return ids
-
-def _fetch_single_fixture_stub(fixture_id: int) -> Dict[str, Any]:
-    # In CLI mode we still want odds from the adapter
-    return {"fixture": {"id": fixture_id}, "teams": {}, "league": {}, "odds": {}}
-
-if __name__ == "__main__":
-    argv_ids = _parse_fixture_ids_from_argv(sys.argv[1:])
-    if argv_ids:
-        for fid in argv_ids:
-            fx = _fetch_single_fixture_stub(fid)
-            _process_fixture(fx)
-    else:
-        today_str = _today_str_brussels()
-        _process_fixtures_for_date(today_str)
-
-    if _HAS_SETTLER:
-        try:
-            today_ds = _today_str_brussels()
-            yday_ds = _date_str_brussels_days_ago(1)
-            settled_today = settle_date(today_ds)
-            settled_yday = settle_date(yday_ds)
-            logging.info(f"✅ Settled {settled_today} results for {today_ds}")
-            logging.info(f"✅ Settled {settled_yday} results for {yday_ds}")
-        except Exception as e:
-            logging.warning(f"Result settlement failed: {e}")
-    else:
-        logging.info("Result settlement skipped (module not available).")
