@@ -26,13 +26,6 @@ def _derive_confidence(pred: Dict[str, Any]) -> float:
     return conf if conf is not None else 0.50
 
 def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -> Tuple[int, str]:
-    """
-    Expects:
-      fixture_id:int, market:str ('over_2_5'), prediction:'Over'|'Under',
-      confidence/ prob_over (floats), odds, edge, rationale
-    Upsert key: (fixture_id, market)
-    Returns (count, message) where count is 1 on success.
-    """
     fixture_id = pred.get("fixture_id")
     market = pred.get("market") or "over_2_5"
     if fixture_id is None or not market:
@@ -46,11 +39,16 @@ def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -
     odds = _to_float(pred.get("odds"))
     edge = _to_float(pred.get("edge"))
 
+    # Rationale: store NULL if empty
     rationale = pred.get("rationale")
     if isinstance(rationale, list):
         rationale = " • ".join([str(x) for x in rationale[:6]])
-    elif rationale is not None:
-        rationale = str(rationale)
+    if isinstance(rationale, str) and rationale.strip() == "":
+        rationale = None
+    if rationale == []:
+        rationale = None
+
+    is_ot = bool(pred.get("is_overtime_odds"))
 
     row = {
         "fixture_id": fixture_id,
@@ -62,35 +60,18 @@ def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -
         "odds": odds,
         "rationale": rationale,
         "edge": round(edge, 4) if edge is not None else None,
-        "is_overtime_odds": False,
+        "is_overtime_odds": is_ot,
         "odds_source": odds_source,
     }
 
     resp = postgrest_upsert("value_predictions", [row], on_conflict="fixture_id,market")
 
-    # --- Make this work across supabase-py versions ---
-    # v2: APIResponse with .data (list|None) and .status_code
-    # Some setups return 201 with empty body unless Prefer:return=representation is set.
-    count = 0
-    msg = "unknown"
-
-    # Try .data first
+    # count from .data if present; else from status
     data = getattr(resp, "data", None)
     if isinstance(data, list):
-        count = len(data)
-        msg = "upserted"
-    else:
-        # Fallback to status code
-        status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
-        if isinstance(status, int) and status in (200, 201, 204):
-            count = 1
-            msg = "upserted"
-        else:
-            # Best effort error text
-            err = getattr(resp, "error", None) or getattr(resp, "message", None)
-            if err:
-                msg = f"error:{err}"
-            else:
-                msg = f"unexpected_response:{type(resp).__name__}"
-
-    return (count, msg)
+        return (len(data), "upserted")
+    status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+    if isinstance(status, int) and status in (200, 201, 204):
+        return (1, "upserted")
+    err = getattr(resp, "error", None) or getattr(resp, "message", None) or f"unexpected:{type(resp).__name__}"
+    return (0, f"error:{err}")
