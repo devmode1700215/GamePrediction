@@ -4,9 +4,11 @@ from __future__ import annotations
 import os
 import logging
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 from utils.safe_get import safe_get
+from utils.safe_get import requests as _requests  # only for type hints/headers present
 
 # -----------------------------------------------------------------------------
 # Setup
@@ -14,33 +16,88 @@ from utils.safe_get import safe_get
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-API_KEY = os.getenv("FOOTBALL_API_KEY")
-BASE_URL = "https://v3.football.api-sports.io"
-HEADERS = {"x-apisports-key": API_KEY}
+API_KEY = os.getenv("FOOTBALL_API_KEY")  # API-Football (API-Sports) key
+BASE_URL = os.getenv("FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
+DEFAULT_TZ = os.getenv("FOOTBALL_TZ", "Europe/Brussels")
 
+HEADERS = {"x-apisports-key": API_KEY} if API_KEY else {}
+
+def _build_url(path: str, params: Dict[str, Any]) -> str:
+    q = {k: v for k, v in params.items() if v is not None and v != ""}
+    return f"{BASE_URL}{path}?{urlencode(q)}"
+
+def _has_params_support() -> bool:
+    # If you replaced safe_get with the version I provided, it supports params=...
+    # We detect by checking the signature presence loosely.
+    try:
+        return "params" in safe_get.__code__.co_varnames
+    except Exception:
+        return False
 
 # -----------------------------------------------------------------------------
-# Fixtures (by single date YYYY-MM-DD)
+# Fixtures (by single date YYYY-MM-DD) — ROBUST
 # -----------------------------------------------------------------------------
 def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
     """
     Fetch fixtures for a given date (YYYY-MM-DD).
-    Returns the list from API-Football: data['response'].
+    Tries with FOOTBALL_TZ first, then UTC as fallback.
+    Emits rich logs so we can see what's wrong if response is empty.
+    Returns data['response'] (list).
     """
-    url = f"{BASE_URL}/fixtures?date={date_str}"
-    resp = safe_get(url, headers=HEADERS)
-    if resp is None:
-        logger.error(f"⚠️ Failed to fetch fixtures for {date_str}: safe_get returned None")
-        return []
-    try:
-        data = resp.json()
-        fixtures = data.get("response", []) or []
-        logger.info(f"📅 {date_str}: fetched {len(fixtures)} fixtures")
-        return fixtures
-    except Exception as e:
-        logger.error(f"⚠️ Error parsing fixtures for {date_str}: {e}")
+    if not API_KEY:
+        logger.error("⚠️ FOOTBALL_API_KEY is not set — cannot fetch fixtures.")
         return []
 
+    def _call(date_str: str, tz: str) -> Optional[List[Dict[str, Any]]]:
+        path = "/fixtures"
+        params = {"date": date_str, "timezone": tz}
+        if _has_params_support():
+            url = f"{BASE_URL}{path}"
+            resp = safe_get(url, headers=HEADERS, params=params)
+        else:
+            url = _build_url(path, params)
+            resp = safe_get(url, headers=HEADERS)
+
+        if resp is None:
+            logger.error(f"⚠️ Failed to fetch fixtures for {date_str} (tz={tz}): safe_get returned None")
+            return None
+
+        # Log status and basic rate-limit headers
+        try:
+            rl_rem = resp.headers.get("x-ratelimit-requests-remaining")
+            rl_day = resp.headers.get("x-ratelimit-requests-limit")
+            logger.info(f"📡 GET {resp.url} | {resp.status_code} | RL {rl_rem}/{rl_day}")
+        except Exception:
+            pass
+
+        try:
+            data = resp.json() or {}
+        except Exception as e:
+            logger.error(f"⚠️ JSON parse error for fixtures {date_str} (tz={tz}): {e}")
+            return None
+
+        # API-Sports errors are in data['errors'] or data['results']==0
+        errors = data.get("errors") or {}
+        if errors:
+            # print the first error for visibility
+            first_key = next(iter(errors.keys()), None)
+            first_msg = errors.get(first_key)
+            logger.error(f"⚠️ API returned errors for {date_str} (tz={tz}): {first_key} -> {first_msg}")
+
+        fixtures = data.get("response", []) or []
+        logger.info(f"📅 {date_str} (tz={tz}): fetched {len(fixtures)} fixtures")
+        return fixtures
+
+    # Try preferred timezone first
+    fixtures = _call(date_str, DEFAULT_TZ)
+    if fixtures is None:
+        return []
+    if len(fixtures) == 0 and DEFAULT_TZ != "UTC":
+        # Retry in UTC if empty (guards date-boundary issues)
+        logger.info(f"↻ Retrying fixtures for {date_str} with tz=UTC (first attempt returned 0).")
+        fixtures = _call(date_str, "UTC") or []
+
+    return fixtures
 
 # -----------------------------------------------------------------------------
 # Odds (normalized to a flat dict your pipeline expects)
@@ -58,8 +115,14 @@ def get_match_odds(
       }
     Tries the preferred bookmaker; falls back to the first with data.
     """
-    url = f"{BASE_URL}/odds?fixture={fixture_id}"
-    resp = safe_get(url, headers=HEADERS)
+    path = "/odds"
+    params = {"fixture": str(fixture_id)}
+    if _has_params_support():
+        url = f"{BASE_URL}{path}"
+        resp = safe_get(url, headers=HEADERS, params=params)
+    else:
+        url = _build_url(path, params)
+        resp = safe_get(url, headers=HEADERS)
 
     out: Dict[str, Optional[float]] = {
         "home_win": None, "draw": None, "away_win": None,
@@ -67,6 +130,7 @@ def get_match_odds(
         "over_2_5": None, "under_2_5": None,
     }
     if resp is None:
+        logger.error(f"⚠️ odds request failed for fixture {fixture_id} (safe_get=None)")
         return out
 
     try:
@@ -133,7 +197,6 @@ def get_match_odds(
         logger.error(f"⚠️ Error parsing odds for fixture {fixture_id}: {e}")
         return out
 
-
 # -----------------------------------------------------------------------------
 # Head-to-Head (last few results)
 # -----------------------------------------------------------------------------
@@ -141,8 +204,15 @@ def get_head_to_head(home_id: int, away_id: int, limit: int = 3) -> List[Dict[st
     """
     Fetch last `limit` H2H fixtures and return a tiny summary.
     """
-    url = f"{BASE_URL}/fixtures/headtohead?h2h={home_id}-{away_id}"
-    resp = safe_get(url, headers=HEADERS)
+    path = "/fixtures/headtohead"
+    params = {"h2h": f"{home_id}-{away_id}"}
+    if _has_params_support():
+        url = f"{BASE_URL}{path}"
+        resp = safe_get(url, headers=HEADERS, params=params)
+    else:
+        url = _build_url(path, params)
+        resp = safe_get(url, headers=HEADERS)
+
     if resp is None:
         return []
     try:
@@ -161,7 +231,6 @@ def get_head_to_head(home_id: int, away_id: int, limit: int = 3) -> List[Dict[st
         logger.error(f"⚠️ Error parsing H2H {home_id}-{away_id}: {e}")
         return []
 
-
 # -----------------------------------------------------------------------------
 # Injuries (per team & season)
 # -----------------------------------------------------------------------------
@@ -172,8 +241,15 @@ def get_team_injuries(team_id: int, season: Optional[int]) -> List[Dict[str, Any
     """
     if not season:
         return []
-    url = f"{BASE_URL}/injuries?team={team_id}&season={season}"
-    resp = safe_get(url, headers=HEADERS)
+    path = "/injuries"
+    params = {"team": str(team_id), "season": str(season)}
+    if _has_params_support():
+        url = f"{BASE_URL}{path}"
+        resp = safe_get(url, headers=HEADERS, params=params)
+    else:
+        url = _build_url(path, params)
+        resp = safe_get(url, headers=HEADERS)
+
     if resp is None:
         return []
     try:
@@ -193,7 +269,6 @@ def get_team_injuries(team_id: int, season: Optional[int]) -> List[Dict[str, Any
         logger.error(f"⚠️ Error parsing injuries for team {team_id}: {e}")
         return []
 
-
 # -----------------------------------------------------------------------------
 # League standings (position)
 # -----------------------------------------------------------------------------
@@ -204,8 +279,15 @@ def get_team_position(team_id: int, league_id: Optional[int], season: Optional[i
     if not league_id or not season:
         return None
 
-    url = f"{BASE_URL}/standings?league={league_id}&season={season}"
-    resp = safe_get(url, headers=HEADERS)
+    path = "/standings"
+    params = {"league": str(league_id), "season": str(season)}
+    if _has_params_support():
+        url = f"{BASE_URL}{path}"
+        resp = safe_get(url, headers=HEADERS, params=params)
+    else:
+        url = _build_url(path, params)
+        resp = safe_get(url, headers=HEADERS)
+
     if resp is None:
         return None
 
@@ -227,7 +309,6 @@ def get_team_position(team_id: int, league_id: Optional[int], season: Optional[i
         logger.error(f"⚠️ Error parsing standings for league {league_id}: {e}")
         return None
 
-
 # -----------------------------------------------------------------------------
 # Form + xG (API-based; returns EXACTLY (form_str, xg))
 # -----------------------------------------------------------------------------
@@ -246,8 +327,15 @@ def get_team_form_and_goals(
     if not league_id or not season:
         return None, None
 
-    url = f"{BASE_URL}/teams/statistics?team={team_id}&league={league_id}&season={season}"
-    resp = safe_get(url, headers=HEADERS)
+    path = "/teams/statistics"
+    params = {"team": str(team_id), "league": str(league_id), "season": str(season)}
+    if _has_params_support():
+        url = f"{BASE_URL}{path}"
+        resp = safe_get(url, headers=HEADERS, params=params)
+    else:
+        url = _build_url(path, params)
+        resp = safe_get(url, headers=HEADERS)
+
     if resp is None:
         return None, None
 
@@ -274,200 +362,23 @@ def get_team_form_and_goals(
         logger.error(f"⚠️ Error parsing team stats for team {team_id}: {e}")
         return None, None
 
-
 # -----------------------------------------------------------------------------
-# Recent goals / form block (last N fixtures)
-# -----------------------------------------------------------------------------
-def get_team_recent_block(team_id: int, last: int = 5) -> Dict[str, Any]:
-    """
-    Build a compact 'recent_form' block from the last N fixtures for a team.
-    {
-      "last": 5,
-      "results": ["W","D","L","W","W"],
-      "goals_for": [2,1,0,3,1],
-      "goals_against": [1,1,2,0,0],
-      "gf_avg": 1.40,
-      "ga_avg": 0.80,
-      "ou25_rate": 0.60,
-      "btts_rate": 0.40
-    }
-    """
-    url = f"{BASE_URL}/fixtures?team={team_id}&last={last}"
-    resp = safe_get(url, headers=HEADERS)
-    if resp is None:
-        return {"last": last, "results": [], "goals_for": [], "goals_against": [], "gf_avg": None, "ga_avg": None, "ou25_rate": None, "btts_rate": None}
-    try:
-        data = resp.json()
-        matches = data.get("response", []) or []
-        results: List[str] = []
-        gf: List[int] = []
-        ga: List[int] = []
-        ou_hits = 0
-        btts_hits = 0
-        for m in matches:
-            teams = m.get("teams", {}) or {}
-            goals = m.get("goals", {}) or {}
-            home = teams.get("home", {}) or {}
-            away = teams.get("away", {}) or {}
-            gh = int(goals.get("home") or 0)
-            ga_ = int(goals.get("away") or 0)
-            # goals for/against from perspective of team_id
-            if home.get("id") == team_id:
-                gf.append(gh)
-                ga.append(ga_)
-                results.append(_wdl(gh, ga_))
-            else:
-                gf.append(ga_)
-                ga.append(gh)
-                results.append(_wdl(ga_, gh))
-            # OU/BTTS
-            total = gh + ga_
-            if total > 2:
-                ou_hits += 1
-            if gh > 0 and ga_ > 0:
-                btts_hits += 1
-
-        n = max(1, len(matches))
-        gf_avg = round(sum(gf) / n, 2) if gf else None
-        ga_avg = round(sum(ga) / n, 2) if ga else None
-        ou_rate = round(ou_hits / n, 3) if matches else None
-        btts_rate = round(btts_hits / n, 3) if matches else None
-        return {
-            "last": last,
-            "results": results,
-            "goals_for": gf,
-            "goals_against": ga,
-            "gf_avg": gf_avg,
-            "ga_avg": ga_avg,
-            "ou25_rate": ou_rate,
-            "btts_rate": btts_rate,
-        }
-    except Exception as e:
-        logger.error(f"⚠️ Error building recent block for team {team_id}: {e}")
-        return {"last": last, "results": [], "goals_for": [], "goals_against": [], "gf_avg": None, "ga_avg": None, "ou25_rate": None, "btts_rate": None}
-
-
-def _wdl(gf: int, ga: int) -> str:
-    if gf > ga:
-        return "W"
-    if gf < ga:
-        return "L"
-    return "D"
-
-
-# -----------------------------------------------------------------------------
-# Team season context (baseline style)
-# -----------------------------------------------------------------------------
-def get_team_season_context(team_id: int, league_id: Optional[int], season: Optional[int]) -> Dict[str, Any]:
-    """
-    Pulls team/season-wide splits; returns compact block:
-    {
-      "matches": 28,
-      "goals_for_pg": 1.75,
-      "goals_against_pg": 1.00,
-      "ou25_rate": 0.57,
-      "btts_rate": 0.54,
-      "form": "W-W-D-L-W"
-    }
-    """
-    if not league_id or not season:
-        return {"matches": None, "goals_for_pg": None, "goals_against_pg": None, "ou25_rate": None, "btts_rate": None, "form": None}
-
-    url = f"{BASE_URL}/teams/statistics?team={team_id}&league={league_id}&season={season}"
-    resp = safe_get(url, headers=HEADERS)
-    if resp is None:
-        return {"matches": None, "goals_for_pg": None, "goals_against_pg": None, "ou25_rate": None, "btts_rate": None, "form": None}
-    try:
-        s = resp.json().get("response", {}) or {}
-
-        played = ((s.get("fixtures") or {}).get("played") or {}).get("total")
-        goals_for_pg = (((s.get("goals") or {}).get("for") or {}).get("average") or {}).get("total")
-        goals_against_pg = (((s.get("goals") or {}).get("against") or {}).get("average") or {}).get("total")
-
-        # OU2.5 rate from 'goals' buckets if available; fallback None
-        # API doesn't give OU2.5 explicitly; we estimate from distribution if present, else None.
-        ou25_rate = None
-        btts_rate = (((s.get("both_teams_to_score") or {}).get("total") or {}).get("percentage"))
-        try:
-            if isinstance(btts_rate, str) and btts_rate.endswith("%"):
-                btts_rate = round(float(btts_rate[:-1]) / 100.0, 3)
-            elif isinstance(btts_rate, (int, float)):
-                btts_rate = round(float(btts_rate), 3)
-            else:
-                btts_rate = None
-        except Exception:
-            btts_rate = None
-
-        form_raw = s.get("form") or ""
-        form_str = "-".join(list(form_raw)) if form_raw else None
-
-        def _num(x):
-            try:
-                return round(float(x), 2) if x is not None else None
-            except Exception:
-                return None
-
-        return {
-            "matches": played,
-            "goals_for_pg": _num(goals_for_pg),
-            "goals_against_pg": _num(goals_against_pg),
-            "ou25_rate": ou25_rate,
-            "btts_rate": btts_rate,
-            "form": form_str,
-        }
-    except Exception as e:
-        logger.error(f"⚠️ Error parsing team season context team {team_id}: {e}")
-        return {"matches": None, "goals_for_pg": None, "goals_against_pg": None, "ou25_rate": None, "btts_rate": None, "form": None}
-
-
-# -----------------------------------------------------------------------------
-# Lineups (confirmed XI & formation) when available
-# -----------------------------------------------------------------------------
-def get_fixture_lineups(fixture_id: int) -> Dict[str, Any]:
-    """
-    Returns:
-    {
-      "home": {"formation": "4-3-3", "coach": "X", "players": [...]},
-      "away": {"formation": "4-2-3-1", "coach": "Y", "players": [...]}
-    }
-    If not yet available, returns {}.
-    """
-    url = f"{BASE_URL}/fixtures/lineups?fixture={fixture_id}"
-    resp = safe_get(url, headers=HEADERS)
-    if resp is None:
-        return {}
-    try:
-        data = resp.json()
-        arr = data.get("response", []) or []
-        out: Dict[str, Any] = {}
-        for block in arr:
-            team = (block.get("team") or {}).get("id")
-            side = "home" if (block.get("team") or {}).get("name") == (block.get("team") or {}).get("name") else None  # we’ll map by team id later if needed
-            item = {
-                "formation": block.get("formation"),
-                "coach": ((block.get("coach") or {}).get("name")),
-                "players": block.get("startXI") or [],
-                "substitutes": block.get("substitutes") or [],
-            }
-            # We can't know home/away here without fixture teams; caller will map by team ids if desired.
-            # Return both entries keyed by team_id for safety:
-            out[str(team)] = item
-        return out
-    except Exception as e:
-        logger.error(f"⚠️ Error parsing lineups for fixture {fixture_id}: {e}")
-        return {}
-
-
-# -----------------------------------------------------------------------------
-# Recent goals (kept for backward compatibility)
+# Recent goals (last N via fixtures endpoint)
 # -----------------------------------------------------------------------------
 def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
     """
     Get the team's goals scored in their last `last` matches via API.
     Returns list like [2,1,0,3,1].
     """
-    url = f"{BASE_URL}/fixtures?team={team_id}&last={last}"
-    resp = safe_get(url, headers=HEADERS)
+    path = "/fixtures"
+    params = {"team": str(team_id), "last": str(last)}
+    if _has_params_support():
+        url = f"{BASE_URL}{path}"
+        resp = safe_get(url, headers=HEADERS, params=params)
+    else:
+        url = _build_url(path, params)
+        resp = safe_get(url, headers=HEADERS)
+
     if resp is None:
         return []
     try:
@@ -487,72 +398,6 @@ def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
         logger.error(f"⚠️ Error parsing recent goals for team {team_id}: {e}")
         return []
 
-
-# -----------------------------------------------------------------------------
-# Enrichment: build all blocks for a fixture (drop-in for main/insert)
-# -----------------------------------------------------------------------------
-def enrich_fixture(fx: Dict[str, Any], *, preferred_bookmaker: str = "Bwin") -> Dict[str, Any]:
-    """
-    Returns the original fixture dict plus:
-      - league_id, season
-      - recent_form_home / recent_form_away
-      - season_stats_home / season_stats_away
-      - injuries_home / injuries_away
-      - lineup_home / lineup_away (when available)
-      - btts_market, ou25_market
-    """
-    fixture = fx.get("fixture", {}) or {}
-    league = fx.get("league", {}) or {}
-    teams = fx.get("teams", {}) or {}
-
-    fixture_id = fixture.get("id")
-    league_id = league.get("id")
-    season = league.get("season")
-
-    home = teams.get("home", {}) or {}
-    away = teams.get("away", {}) or {}
-    home_id = home.get("id")
-    away_id = away.get("id")
-
-    # Markets from odds (single bookmaker snapshot)
-    odds = get_match_odds(fixture_id, preferred_bookmaker=preferred_bookmaker)
-    ou25_market = {"over": odds.get("over_2_5"), "under": odds.get("under_2_5")}
-    btts_market = {"yes": odds.get("btts_yes"), "no": odds.get("btts_no")}
-
-    # Recent form blocks
-    recent_home = get_team_recent_block(home_id, last=5) if home_id else {}
-    recent_away = get_team_recent_block(away_id, last=5) if away_id else {}
-
-    # Season context
-    season_home = get_team_season_context(home_id, league_id, season) if home_id else {}
-    season_away = get_team_season_context(away_id, league_id, season) if away_id else {}
-
-    # Injuries
-    injuries_home = get_team_injuries(home_id, season) if home_id else []
-    injuries_away = get_team_injuries(away_id, season) if away_id else []
-
-    # Lineups (dictionary keyed by team_id as string)
-    raw_lineups = get_fixture_lineups(fixture_id) if fixture_id else {}
-    lineup_home = raw_lineups.get(str(home_id)) if home_id else None
-    lineup_away = raw_lineups.get(str(away_id)) if away_id else None
-
-    # Attach enrichment to a copy of the original
-    out = dict(fx)
-    out["league_id"] = league_id
-    out["season"] = season
-    out["ou25_market"] = ou25_market
-    out["btts_market"] = btts_market
-    out["recent_form_home"] = recent_home
-    out["recent_form_away"] = recent_away
-    out["season_stats_home"] = season_home
-    out["season_stats_away"] = season_away
-    out["injuries_home"] = injuries_home
-    out["injuries_away"] = injuries_away
-    out["lineup_home"] = lineup_home
-    out["lineup_away"] = lineup_away
-    return out
-
-
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -562,7 +407,6 @@ def _to_float(x: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-
 __all__ = [
     "fetch_fixtures",
     "get_match_odds",
@@ -571,8 +415,4 @@ __all__ = [
     "get_team_position",
     "get_recent_goals",
     "get_team_form_and_goals",
-    "get_team_recent_block",
-    "get_team_season_context",
-    "get_fixture_lineups",
-    "enrich_fixture",
 ]
