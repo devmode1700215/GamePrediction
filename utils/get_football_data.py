@@ -16,9 +16,9 @@ from utils.safe_get import safe_get
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-API_KEY   = os.getenv("FOOTBALL_API_KEY")  # API-Football (API-Sports) key
-BASE_URL  = os.getenv("FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
-DEFAULT_TZ = os.getenv("FOOTBALL_TZ", "Europe/Brussels")
+API_KEY    = os.getenv("FOOTBALL_API_KEY")  # API-Football (API-Sports) key
+BASE_URL   = os.getenv("FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
+DEFAULT_TZ = os.getenv("FOOTBALL_TZ", "UTC")  # keep UTC to avoid day-boundary surprises
 
 HEADERS = {"x-apisports-key": API_KEY} if API_KEY else {}
 
@@ -33,7 +33,6 @@ def _now_iso() -> str:
         return datetime.utcnow().isoformat() + "Z"
 
 def _has_params_support() -> bool:
-    # detect if your safe_get supports a params kwarg (ours does, but keep backward-compat)
     try:
         return "params" in safe_get.__code__.co_varnames
     except Exception:
@@ -46,14 +45,12 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 # -----------------------------------------------------------------------------
-# Fixtures (by single date YYYY-MM-DD) — ROBUST
+# Fixtures (by date YYYY-MM-DD) — robust logs + tz
 # -----------------------------------------------------------------------------
 def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
     """
-    Fetch fixtures for a given date (YYYY-MM-DD).
-    Tries with FOOTBALL_TZ first, then UTC as fallback.
-    Emits rich logs so we can see what's wrong if response is empty.
-    Returns data['response'] (list).
+    Fetch fixtures for a given date (YYYY-MM-DD) in DEFAULT_TZ.
+    If empty, retry with UTC once (if DEFAULT_TZ != UTC).
     """
     if not API_KEY:
         logger.error("⚠️ FOOTBALL_API_KEY is not set — cannot fetch fixtures.")
@@ -73,7 +70,6 @@ def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
             logger.error(f"⚠️ Failed to fetch fixtures for {date_str} (tz={tz}): safe_get returned None")
             return None
 
-        # Log status and basic rate-limit headers
         try:
             rl_rem = resp.headers.get("x-ratelimit-requests-remaining")
             rl_day = resp.headers.get("x-ratelimit-requests-limit")
@@ -91,38 +87,30 @@ def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
         if errors:
             first_key = next(iter(errors.keys()), None)
             first_msg = errors.get(first_key)
-            logger.error(f"⚠️ API returned errors for {date_str} (tz={tz}): {first_key} -> {first_msg}")
+            logger.error(f"⚠️ API errors for {date_str} (tz={tz}): {first_key} -> {first_msg}")
 
         fixtures = data.get("response", []) or []
         logger.info(f"📅 {date_str} (tz={tz}): fetched {len(fixtures)} fixtures")
         return fixtures
 
-    # Try preferred timezone first
     fixtures = _call(date_str, DEFAULT_TZ)
     if fixtures is None:
         return []
     if len(fixtures) == 0 and DEFAULT_TZ != "UTC":
-        # Retry in UTC if empty (guards date-boundary issues)
         logger.info(f"↻ Retrying fixtures for {date_str} with tz=UTC (first attempt returned 0).")
         fixtures = _call(date_str, "UTC") or []
-
     return fixtures
 
 # -----------------------------------------------------------------------------
-# Odds (normalized to a flat dict your pipeline expects)
+# Odds (flat dict your pipeline expects)
 # -----------------------------------------------------------------------------
 def get_match_odds(
     fixture_id: int,
     preferred_bookmaker: str = "Bwin",
 ) -> Dict[str, Optional[float]]:
     """
-    Return normalized odds for the fixture:
-      {
-        "home_win", "draw", "away_win",
-        "btts_yes", "btts_no",
-        "over_2_5", "under_2_5"
-      }
-    Tries the preferred bookmaker; falls back to the first with data.
+    Return normalized odds:
+      home_win, draw, away_win, btts_yes, btts_no, over_2_5, under_2_5
     """
     path = "/odds"
     params = {"fixture": str(fixture_id)}
@@ -148,7 +136,6 @@ def get_match_odds(
         if not blocks:
             return out
 
-        # Pick bookmaker
         chosen = None
         for blk in blocks:
             for bm in blk.get("bookmakers", []) or []:
@@ -158,7 +145,6 @@ def get_match_odds(
             if chosen:
                 break
         if not chosen:
-            # Fallback: first bookmaker with data
             for blk in blocks:
                 bms = blk.get("bookmakers", []) or []
                 if bms:
@@ -210,9 +196,6 @@ def get_match_odds(
 # Head-to-Head (last few results)
 # -----------------------------------------------------------------------------
 def get_head_to_head(home_id: int, away_id: int, limit: int = 3) -> List[Dict[str, Any]]:
-    """
-    Fetch last `limit` H2H fixtures and return a tiny summary.
-    """
     path = "/fixtures/headtohead"
     params = {"h2h": f"{home_id}-{away_id}"}
     if _has_params_support():
@@ -244,10 +227,6 @@ def get_head_to_head(home_id: int, away_id: int, limit: int = 3) -> List[Dict[st
 # Injuries (per team & season)
 # -----------------------------------------------------------------------------
 def get_team_injuries(team_id: int, season: Optional[int]) -> List[Dict[str, Any]]:
-    """
-    Return list of injuries for a team in a given season.
-    If season is None, returns [] (API requires season).
-    """
     if not season:
         return []
     path = "/injuries"
@@ -279,12 +258,9 @@ def get_team_injuries(team_id: int, season: Optional[int]) -> List[Dict[str, Any
         return []
 
 # -----------------------------------------------------------------------------
-# League standings (position)
+# Team position (standings) — optional helper if needed
 # -----------------------------------------------------------------------------
 def get_team_position(team_id: int, league_id: Optional[int], season: Optional[int]) -> Optional[int]:
-    """
-    Return the team's rank from standings, or None.
-    """
     if not league_id or not season:
         return None
 
@@ -319,20 +295,13 @@ def get_team_position(team_id: int, league_id: Optional[int], season: Optional[i
         return None
 
 # -----------------------------------------------------------------------------
-# Form + xG (API-based; returns EXACTLY (form_str, xg))
+# Form + xG (API: teams/statistics) — returns (form_str, xg)
 # -----------------------------------------------------------------------------
 def get_team_form_and_goals(
     team_id: int,
     league_id: Optional[int],
     season: Optional[int],
 ) -> Tuple[Optional[str], Optional[float]]:
-    """
-    Matches your main.py expectations:
-      returns (form_str, xg)
-
-    - form_str: e.g. "W-W-D-L-W" (or None if unavailable)
-    - xg: float from API 'expected.goals.for.average.total' (or None)
-    """
     if not league_id or not season:
         return None, None
 
@@ -351,11 +320,9 @@ def get_team_form_and_goals(
     try:
         stats = resp.json().get("response", {}) or {}
 
-        # Form "WWDLW" -> "W-W-D-L-W"
-        form_raw = stats.get("form") or ""
+        form_raw = stats.get("form") or ""  # e.g. "WWDLW"
         form_str = "-".join(list(form_raw)) if form_raw else None
 
-        # xG path: expected.goals.for.average.total
         expected = stats.get("expected", {}) or {}
         goals = expected.get("goals", {}) or {}
         for_side = goals.get("for", {}) or {}
@@ -375,10 +342,6 @@ def get_team_form_and_goals(
 # Recent goals (last N via fixtures endpoint)
 # -----------------------------------------------------------------------------
 def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
-    """
-    Get the team's goals scored in their last `last` matches via API.
-    Returns list like [2,1,0,3,1].
-    """
     path = "/fixtures"
     params = {"team": str(team_id), "last": str(last)}
     if _has_params_support():
@@ -408,7 +371,7 @@ def get_recent_goals(team_id: int, last: int = 5) -> List[int]:
         return []
 
 # -----------------------------------------------------------------------------
-# Enrichment (what main.py imports)
+# Enrichment (used by main.py)
 # -----------------------------------------------------------------------------
 def enrich_fixture(
     fx_raw: Dict[str, Any],
@@ -419,20 +382,18 @@ def enrich_fixture(
     Take a single fixture object from /fixtures and attach:
       - league_id, season
       - recent_form_home/away  (form_str, xg)
-      - season_stats_home/away (currently xg only, keep shape extensible)
+      - season_stats_home/away (currently xg only; extensible)
       - injuries_home/away     (list)
-      - lineup_home/away       (None placeholder — lineups often unavailable in advance)
+      - lineup_home/away       (None placeholder)
       - ou25_market            (over/under prices)
       - btts_market            (btts yes/no prices)
-      - odds                   (flat block from get_match_odds for convenience)
+      - odds                   (flat odds for convenience)
       - last_enriched_at       (timestamptz string)
-    Returns a dict that still contains the original fixture/teams/league blocks.
     """
     fixture = fx_raw.get("fixture", {}) or {}
     league  = fx_raw.get("league", {}) or {}
     teams   = fx_raw.get("teams", {}) or {}
 
-    # ids / season
     league_id = league.get("id")
     season    = league.get("season")
     home = teams.get("home", {}) or {}
@@ -445,7 +406,6 @@ def enrich_fixture(
     form_home, xg_home = get_team_form_and_goals(home_id, league_id, season) if home_id else (None, None)
     form_away, xg_away = get_team_form_and_goals(away_id, league_id, season) if away_id else (None, None)
 
-    # Season context (keep flexible; you can add more stats later)
     season_home = {"xg_for_avg": xg_home}
     season_away = {"xg_for_avg": xg_away}
 
@@ -464,21 +424,15 @@ def enrich_fixture(
         "no":  flat_odds.get("btts_no"),
     }
 
-    # Build enriched dict
     enriched = {
-        # original blocks
         "fixture": fixture,
         "league": league,
         "teams": teams,
-
-        # helpful denorms
         "league_id": league_id,
         "season": season,
         "home_team": {"id": home_id, "name": home.get("name")},
         "away_team": {"id": away_id, "name": away.get("name")},
         "venue": fixture.get("venue", {}) or {},
-
-        # enrichment
         "recent_form_home": {"form": form_home, "xg_for_avg": xg_home},
         "recent_form_away": {"form": form_away, "xg_for_avg": xg_away},
         "season_stats_home": season_home,
@@ -487,16 +441,11 @@ def enrich_fixture(
         "injuries_away": injuries_away,
         "lineup_home": None,
         "lineup_away": None,
-
-        # market views and raw odds
         "ou25_market": ou25_market,
         "btts_market": btts_market,
         "odds": flat_odds,
-
-        # bookkeeping
         "last_enriched_at": _now_iso(),
     }
-
     return enriched
 
 # -----------------------------------------------------------------------------
