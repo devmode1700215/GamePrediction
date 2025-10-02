@@ -16,10 +16,11 @@ logging.basicConfig(
 # ---------------------------------
 # Config
 # ---------------------------------
+APP_TZ = os.getenv("APP_TZ", "UTC")          # What "today/yesterday" mean for fetch/settlement
+LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "1"))  # today + 1 day ahead (default)
 PREFERRED_BOOK = os.getenv("PREF_BOOK", "Bwin")
 INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
-LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "2"))  # today + N days ahead
-SCORING_DEBUG = os.getenv("SCORING_DEBUG", "true").lower() in ("1", "true", "yes", "y")
+SCORING_DEBUG = os.getenv("SCORING_DEBUG", "false").lower() in ("1", "true", "yes", "y")
 
 # ---------------------------------
 # Repo utils
@@ -51,27 +52,27 @@ except Exception as _e:
 
 
 # ---------------------------------
-# Time helpers
+# Time helpers (APP_TZ)
 # ---------------------------------
-def _now_brussels() -> datetime:
+def _now_app() -> datetime:
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("Europe/Brussels"))
+        return datetime.now(ZoneInfo(APP_TZ))
     except Exception:
-        return datetime.now()
+        return datetime.utcnow()
 
-def _today_str_brussels() -> str:
-    return _now_brussels().strftime("%Y-%m-%d")
+def _today_str_app() -> str:
+    return _now_app().strftime("%Y-%m-%d")
 
-def _date_str_brussels_days_ago(days: int) -> str:
-    return (_now_brussels() - timedelta(days=days)).strftime("%Y-%m-%d")
+def _date_str_app_days_ago(days: int) -> str:
+    return (_now_app() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-def _date_str_brussels_days_ahead(days: int) -> str:
-    return (_now_brussels() + timedelta(days=days)).strftime("%Y-%m-%d")
+def _date_str_app_days_ahead(days: int) -> str:
+    return (_now_app() + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 # ---------------------------------
-# Odds helpers (API-Football only)
+# Odds helper (API-Football only)
 # ---------------------------------
 def _choose_ou_odds(fx: Dict[str, Any], fixture_id: int) -> Dict[str, Optional[float]]:
     """
@@ -89,7 +90,7 @@ def _choose_ou_odds(fx: Dict[str, Any], fixture_id: int) -> Dict[str, Optional[f
 
 
 # ---------------------------------
-# LLM payload helpers
+# LLM payload
 # ---------------------------------
 def _build_llm_payload_from_enriched(
     fx_enriched: Dict[str, Any],
@@ -106,7 +107,7 @@ def _build_llm_payload_from_enriched(
     league_id = fx_enriched.get("league_id") or league.get("id")
     season = fx_enriched.get("season") or league.get("season")
 
-    # H2H (last 3)
+    # H2H (last 3) — done here to keep enrich light/reusable
     h2h = []
     try:
         hid, aid = home.get("id"), away.get("id")
@@ -133,10 +134,14 @@ def _build_llm_payload_from_enriched(
         "away_team": {"id": away.get("id"), "name": away.get("name")},
         "head_to_head": h2h,
         "odds": {"over_2_5": None, "under_2_5": None, "source": "apifootball"},
-        "recent_form": {"home": fx_enriched.get("recent_form_home"), "away": fx_enriched.get("recent_form_away")},
-        "season_context": {"home": fx_enriched.get("season_stats_home"), "away": fx_enriched.get("season_stats_away")},
-        "injuries": {"home": fx_enriched.get("injuries_home"), "away": fx_enriched.get("injuries_away")},
-        "lineups": {"home": fx_enriched.get("lineup_home"), "away": fx_enriched.get("lineup_away")},
+        "recent_form": {"home": fx_enriched.get("recent_form_home"),
+                        "away": fx_enriched.get("recent_form_away")},
+        "season_context": {"home": fx_enriched.get("season_stats_home"),
+                           "away": fx_enriched.get("season_stats_away")},
+        "injuries": {"home": fx_enriched.get("injuries_home"),
+                     "away": fx_enriched.get("injuries_away")},
+        "lineups": {"home": fx_enriched.get("lineup_home"),
+                    "away": fx_enriched.get("lineup_away")},
     }
     return payload
 
@@ -189,7 +194,7 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
         logging.warning("Skipping fixture without fixture_id.")
         return
 
-    # 1) Enrich (form, season, injuries, lineups, OU/BTTS markets)
+    # 1) Enrich with form/xG, injuries, OU/BTTS markets
     fx_enriched = enrich_fixture(fx_raw, preferred_bookmaker=PREFERRED_BOOK)
 
     # 2) Upsert the match row
@@ -200,29 +205,21 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     except Exception as e:
         logging.error(f"❌ insert_match failed for fixture {fixture_id}: {e}")
 
-    # 3) Choose OU2.5 odds (API-Football only)
-    ou_flat = _choose_ou_odds(fx_enriched, fixture_id)
-
-    # 4) Build payload with chosen odds
+    # 3) Build payload + attach OU2.5 odds
     payload = _build_llm_payload_from_enriched(fx_enriched)
-    payload["odds"] = {
-        "over_2_5": ou_flat.get("over_2_5"),
-        "under_2_5": ou_flat.get("under_2_5"),
-        "source": "apifootball",
-    }
+    ou = _choose_ou_odds(fx_enriched, fixture_id)
+    payload["odds"] = {"over_2_5": ou.get("over_2_5"), "under_2_5": ou.get("under_2_5"), "source": "apifootball"}
 
-    # Require at least one side to proceed
     if payload["odds"]["over_2_5"] is None and payload["odds"]["under_2_5"] is None:
         logging.info(f"ℹ️ No OU2.5 prices for fixture {fixture_id}; skipping prediction.")
         return
 
-    # 5) Predict
+    # 4) Predict
     try:
         pred = get_prediction(payload) or {}
     except Exception as e:
         logging.error(f"❌ get_prediction() failed for fixture {fixture_id}: {e}")
         return
-
     if not pred:
         logging.info(f"ℹ️ Predictor returned empty for fixture {fixture_id}; skipping.")
         return
@@ -231,13 +228,13 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     pred.setdefault("fixture_id", fixture_id)
     pred.setdefault("market", "over_2_5")
 
-    # Debug
-    _log_scoring_debug(fixture_id, pred)
+    if SCORING_DEBUG:
+        _log_scoring_debug(fixture_id, pred)
 
-    # 6) Optional inversion
+    # 5) Optional inversion
     final_pred = _maybe_invert(pred, payload.get("odds") or {})
 
-    # 7) Store prediction
+    # 6) Store prediction
     try:
         count, msg = insert_value_predictions(final_pred, odds_source="apifootball")
         if count:
@@ -281,9 +278,7 @@ def _parse_fixture_ids_from_argv(argv: List[str]) -> List[int]:
 
 
 def _fetch_single_fixture_stub(fixture_id: int) -> Dict[str, Any]:
-    """
-    Minimal fixture stub for CLI runs with explicit IDs.
-    """
+    """Minimal stub for CLI runs with explicit IDs."""
     try:
         odds = get_match_odds(fixture_id) or {}
     except Exception:
@@ -307,17 +302,17 @@ if __name__ == "__main__":
             fx = _fetch_single_fixture_stub(fid)
             _process_fixture(fx)
     else:
-        # Process today + N days ahead (default 2)
+        # Process today + LOOKAHEAD_DAYS ahead
         for d in range(0, LOOKAHEAD_DAYS + 1):
-            ds = _today_str_brussels() if d == 0 else _date_str_brussels_days_ahead(d)
+            ds = _today_str_app() if d == 0 else _date_str_app_days_ahead(d)
             logging.info(f"▶ Processing fixtures for {ds}")
             _process_fixtures_for_date(ds)
 
-    # Settle today & yesterday only (never settle future dates)
+    # Settle only today & yesterday
     if _HAS_SETTLER:
         try:
-            today_ds = _today_str_brussels()
-            yday_ds = _date_str_brussels_days_ago(1)
+            today_ds = _today_str_app()
+            yday_ds = _date_str_app_days_ago(1)
             settled_today = settle_date(today_ds)
             settled_yday = settle_date(yday_ds)
             logging.info(f"✅ Settled {settled_today} results for {today_ds}")
