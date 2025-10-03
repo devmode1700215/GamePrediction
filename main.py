@@ -17,6 +17,8 @@ logging.basicConfig(
 # Config
 # -----------------------------------------------------------------------------
 APP_TZ = os.getenv("APP_TZ", "UTC")              # e.g. "America/Los_Angeles"
+LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "1"))  # process today + N days ahead
+
 ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
 PREFERRED_BOOK = os.getenv("PREF_BOOK", "Bwin")
 INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
@@ -30,7 +32,7 @@ from utils.get_football_data import (
     get_match_odds,
 )
 
-# enrich_fixture is optional across your branches — make it safe:
+# enrich_fixture is optional across branches — make it safe
 try:
     from utils.get_football_data import enrich_fixture as _enrich_fixture
     def enrich_fixture_safe(fx_raw: Dict[str, Any], preferred_bookmaker: str = PREFERRED_BOOK) -> Dict[str, Any]:
@@ -57,7 +59,16 @@ except Exception:
 
 from utils.insert_match import insert_match
 from utils.insert_value_predictions import insert_value_predictions
-from utils.get_prediction import get_prediction  # <- your restored weighted engine lives here
+from utils.get_prediction import get_prediction  # <- your weighted engine lives here
+
+# Supabase client (for "exists?" checks)
+try:
+    from utils.supabaseClient import supabase
+    _HAS_SUPABASE = True
+except Exception as e:
+    logging.warning(f"Could not import utils.supabaseClient: {e}")
+    supabase = None
+    _HAS_SUPABASE = False
 
 # Optional inverter
 try:
@@ -66,7 +77,7 @@ try:
 except Exception:
     _HAS_INVERTER = False
 
-# Result settlement (REQUIRED for writing verifications/patching results)
+# Result settlement
 try:
     from utils.settle_results import settle_date
     _HAS_SETTLER = True
@@ -87,6 +98,9 @@ def _now_app():
 
 def _date_str_app_days_ago(days: int) -> str:
     return (_now_app() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+def _date_str_app_days_ahead(days: int) -> str:
+    return (_now_app() + timedelta(days=days)).strftime("%Y-%m-%d")
 
 def _today_str_app() -> str:
     return _now_app().strftime("%Y-%m-%d")
@@ -118,7 +132,33 @@ def _choose_ou_odds(fx: Dict[str, Any], fixture_id: Optional[int]) -> Dict[str, 
 
 
 # -----------------------------------------------------------------------------
-# Build prediction payload (matches the structure your predictor expects)
+# Pre-checks to reduce duplicate work
+# -----------------------------------------------------------------------------
+def _prediction_exists(fid: int, market: str = "over_2_5") -> bool:
+    """
+    Returns True if a value_predictions row exists for (fixture_id, market).
+    Keeps API/compute low by skipping already-processed fixtures.
+    """
+    if not _HAS_SUPABASE:
+        return False
+    try:
+        res = (
+            supabase.table("value_predictions")
+            .select("id")
+            .eq("fixture_id", fid)
+            .eq("market", market)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return len(rows) > 0
+    except Exception as e:
+        logging.info(f"exists-check failed for {fid}: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
+# Build prediction payload (matches your predictor)
 # -----------------------------------------------------------------------------
 def _build_payload_from_enriched(
     fx_enriched: Dict[str, Any],
@@ -176,7 +216,6 @@ def _build_payload_from_enriched(
             "under_2_5": ou.get("under_2_5"),
             "source": odds_src,
         },
-        # Context used by your predictor’s weighted logic
         "recent_form": {
             "home": fx_enriched.get("recent_form_home"),
             "away": fx_enriched.get("recent_form_away"),
@@ -222,6 +261,11 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
         logging.warning("Skipping fixture without fixture_id.")
         return
 
+    # Skip if we already have a prediction for this fixture/market
+    if _prediction_exists(fixture_id, "over_2_5"):
+        logging.info(f"⏭  Skip fixture {fixture_id}: value_predictions already has OU2.5")
+        return
+
     # 1) Enrich (if available)
     fx_enriched = enrich_fixture_safe(fx_raw, preferred_bookmaker=PREFERRED_BOOK)
 
@@ -241,7 +285,7 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
         logging.info(f"ℹ️ No OU2.5 prices for fixture {fixture_id}; skipping prediction.")
         return
 
-    # 4) Model prediction (classic weighted engine inside utils/get_prediction.py)
+    # 4) Model prediction
     try:
         pred = get_prediction(payload) or {}
     except Exception as e:
@@ -328,9 +372,11 @@ if __name__ == "__main__":
             fx = _fetch_single_fixture_stub(fid)
             _process_fixture(fx)
     else:
-        # Process TODAY only (in APP_TZ) — keep API usage low
-        today_str = _today_str_app()
-        _process_fixtures_for_date(today_str)
+        # Process TODAY + LOOKAHEAD_DAYS ahead (in APP_TZ)
+        run_days = [0] + list(range(1, max(0, LOOKAHEAD_DAYS) + 1))
+        for d in run_days:
+            ds = _date_str_app_days_ahead(d)
+            _process_fixtures_for_date(ds)
 
     # --- Result settlement (today, yesterday, day-2) ---
     if _HAS_SETTLER:
