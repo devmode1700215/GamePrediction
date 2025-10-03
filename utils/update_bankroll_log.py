@@ -1,28 +1,32 @@
 # utils/update_bankroll_log.py
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Set, List, Dict, Any
+from typing import Optional, Set, List, Dict, Any, Tuple
 
 from utils.supabaseClient import supabase
 
 # =============================================================================
 # Settings (override via env)
 # =============================================================================
-START_DATE       = os.getenv("BANKROLL_START_DATE", "2025-06-22")   # inclusive (YYYY-MM-DD)
-EXCLUDE_DATES: Set[str] = set(filter(None, os.getenv("BANKROLL_EXCLUDE_DATES", "").split(",")))
+LABEL               = os.getenv("BANKROLL_LABEL", "default")
+DEFAULT_BANKROLL    = float(os.getenv("BANKROLL_START", "1000"))
+DEFAULT_UNIT_PCT    = float(os.getenv("BANKROLL_DEFAULT_UNIT_PCT", "1.0"))   # % of bankroll when stake_pct is missing/invalid
+MIN_STAKE_AMOUNT    = float(os.getenv("BANKROLL_MIN_STAKE", "0.10"))         # avoid 0 after rounding
+REBUILD             = os.getenv("BANKROLL_REBUILD", "false").lower() in ("1","true","yes","y")
+PO_VALUE_ONLY       = os.getenv("BANKROLL_PO_VALUE_ONLY", "true").lower() in ("1","true","yes","y")
 
-# Filters for value_predictions used in bankroll compounding
-ODDS_MIN         = float(os.getenv("BANKROLL_ODDS_MIN", "1.7"))
-ODDS_MAX         = float(os.getenv("BANKROLL_ODDS_MAX", "2.3"))
-CONF_MIN         = float(os.getenv("BANKROLL_CONF_MIN", "70"))
-ONLY_MARKETS     = [m.strip() for m in os.getenv("BANKROLL_ONLY_MARKETS", "").split(",") if m.strip()]  # e.g. "over_2_5,btts"
+# Optional filters
+ODDS_MIN            = float(os.getenv("BANKROLL_ODDS_MIN", "1.01"))          # let you filter later if you like
+ODDS_MAX            = float(os.getenv("BANKROLL_ODDS_MAX", "1000"))
+CONF_MIN            = float(os.getenv("BANKROLL_CONF_MIN", "0"))             # value_predictions.confidence_pct (0-100)
+ONLY_MARKETS        = [m.strip() for m in os.getenv("BANKROLL_ONLY_MARKETS", "over_2_5").split(",") if m.strip()]
 
-# Bankroll behavior
-DEFAULT_BANKROLL = float(os.getenv("BANKROLL_START", "100"))
-LABEL            = os.getenv("BANKROLL_LABEL", "default")
-BATCH_SIZE       = int(os.getenv("BANKROLL_BATCH_SIZE", "1000"))
+# Paging
+BATCH_SIZE          = int(os.getenv("BANKROLL_BATCH_SIZE", "1000"))
 
 # =============================================================================
 # Helpers
@@ -36,21 +40,50 @@ def _to_float(x) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-def _stake_fraction(raw) -> float:
+def _as_fraction(pct_or_frac: Any) -> float:
     """
-    Accepts 1 => 1% and 0.01 => 1%. If invalid, returns 0.0.
+    Accepts:
+      - 2   -> 0.02 (2%)
+      - 0.02-> 0.02 (2%)
+      - "2" or "0.02" -> parsed accordingly
+    Returns 0.0 on invalid.
     """
-    v = _to_float(raw)
-    if v is None: return 0.0
+    v = _to_float(pct_or_frac)
+    if v is None:
+        return 0.0
     return v / 100.0 if v > 1 else v
 
-# ---- state snapshot (optional table) ----------------------------------------
-def _read_state_bankroll(label: str) -> Optional[float]:
+def _safe_round_money(x: float) -> float:
+    return round(x + 1e-9, 2)
+
+# =============================================================================
+# IO to Supabase
+# =============================================================================
+def _delete_rows_for_label(label: str) -> int:
+    try:
+        res = supabase.table("bankroll_log").delete().eq("label", label).execute()
+        data = getattr(res, "data", None) or []
+        return len(data)
+    except Exception:
+        # Some clients return count via headers; ignore exact count on delete
+        return 0
+
+def _read_last_bankroll_state(label: str) -> Optional[float]:
+    # Try bankroll_state
     try:
         r = supabase.table("bankroll_state").select("bankroll").eq("label", label).limit(1).execute()
         rows = getattr(r, "data", None) or []
         if rows:
             return _to_float(rows[0].get("bankroll"))
+    except Exception:
+        pass
+    # Fallback to last bankroll_log row for label
+    try:
+        r = supabase.table("bankroll_log").select("bankroll_after").eq("label", label)\
+            .order("created_at", desc=True).limit(1).execute()
+        rows = getattr(r, "data", None) or []
+        if rows:
+            return _to_float(rows[0].get("bankroll_after"))
     except Exception:
         pass
     return None
@@ -62,235 +95,192 @@ def _write_state_bankroll(label: str, bankroll: float):
             on_conflict="label",
         ).execute()
     except Exception:
-        # table may not exist; ignore
         pass
 
-# ---- fallback to last log row -----------------------------------------------
-def _read_last_bankroll_from_log() -> Optional[float]:
-    # prefer created_at if present
-    try:
-        r = supabase.table("bankroll_log").select("bankroll_after, created_at")\
-            .order("created_at", desc=True).limit(1).execute()
-        rows = getattr(r, "data", None) or []
-        if rows:
-            b = _to_float(rows[0].get("bankroll_after"))
-            if b is not None:
-                return b
-    except Exception:
-        pass
+def _load_all_verifications_sorted() -> List[Dict[str, Any]]:
+    """
+    Get ALL verifications in ascending time order.
+    We’ll join to value_predictions and filter there.
+    """
+    out: List[Dict[str, Any]] = []
+    page = None
+    while True:
+        try:
+            q = supabase.table("verifications").select(
+                "prediction_id, fixture_id, verified_at, is_correct"
+            ).order("verified_at", desc=False).limit(BATCH_SIZE)
+            if page:
+                q = q.range(page, page + BATCH_SIZE - 1)
+            res = q.execute()
+            rows = getattr(res, "data", None) or []
+            if not rows:
+                break
+            out.extend(rows)
+            if len(rows) < BATCH_SIZE:
+                break
+            page = (page or 0) + BATCH_SIZE
+        except Exception:
+            break
+    return out
 
-    # fallback to date field
-    try:
-        r = supabase.table("bankroll_log").select("bankroll_after, date")\
-            .order("date", desc=True).limit(1).execute()
-        rows = getattr(r, "data", None) or []
-        if rows:
-            b = _to_float(rows[0].get("bankroll_after"))
-            if b is not None:
-                return b
-    except Exception:
-        pass
-
-    return None
-
-# ---- idempotency set --------------------------------------------------------
-def _existing_logged_prediction_ids() -> Set[str]:
-    try:
-        r = supabase.table("bankroll_log").select("prediction_id").execute()
-        rows = getattr(r, "data", None) or []
-        return {row["prediction_id"] for row in rows if row.get("prediction_id")}
-    except Exception:
-        return set()
-
-# ---- verifications ----------------------------------------------------------
-def _load_verifications_since(start_date: str) -> List[Dict[str, Any]]:
-    try:
-        r = (
-            supabase.table("verifications")
-            .select("prediction_id, verified_at, is_correct")
-            .gte("verified_at", f"{start_date}T00:00:00Z")
-            .order("verified_at", desc=True)
-            .limit(5000)
-            .execute()
-        )
-        return getattr(r, "data", None) or []
-    except Exception:
-        return []
-
-# ---- value_predictions with filters ----------------------------------------
-def _load_predictions_by_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+def _load_predictions_for_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Load value_predictions rows for given prediction ids and apply filters.
+    Returns dict[id] = row
+    """
     out: Dict[str, Dict[str, Any]] = {}
     for i in range(0, len(pred_ids), BATCH_SIZE):
-        chunk = pred_ids[i : i + BATCH_SIZE]
+        chunk = pred_ids[i:i+BATCH_SIZE]
         try:
             q = supabase.table("value_predictions").select(
-                "id, market, prediction, stake_pct, odds, confidence_pct, po_value"
-            ).in_("id", chunk)\
-             .gte("confidence_pct", CONF_MIN)\
-             .gte("odds", ODDS_MIN)\
-             .lte("odds", ODDS_MAX)\
-             .eq("po_value", True)
+                "id, fixture_id, market, prediction, odds, confidence_pct, stake_pct"
+            ).in_("id", chunk)
 
+            # Filters
             if ONLY_MARKETS:
-                # add market filter
                 q = q.in_("market", ONLY_MARKETS)
+            if PO_VALUE_ONLY:
+                q = q.eq("po_value", True)
+            q = q.gte("odds", ODDS_MIN).lte("odds", ODDS_MAX)
+            if CONF_MIN > 0:
+                q = q.gte("confidence_pct", CONF_MIN)
 
             res = q.execute()
             rows = getattr(res, "data", None) or []
             for r in rows:
                 out[r["id"]] = r
         except Exception:
-            # skip batch on error
             continue
     return out
 
+def _upsert_logs(rows: List[Dict[str, Any]]) -> bool:
+    """
+    Upsert by prediction_id to keep idempotency.
+    """
+    if not rows:
+        return True
+    try:
+        supabase.table("bankroll_log").upsert(rows, on_conflict="prediction_id").execute()
+        return True
+    except Exception as e:
+        print(f"upsert bankroll_log failed: {e}")
+        return False
+
 # =============================================================================
-# Main entrypoint
+# Core
 # =============================================================================
-def update_bankroll_log():
+def _compute_row(
+    bankroll_before: float,
+    v: Dict[str, Any],
+    p: Dict[str, Any],
+    label: str
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Returns (new_bankroll_after, row_dict)
+    """
+    verified_at = v.get("verified_at") or _now_iso()
+    date_str    = (verified_at or "").split("T")[0]
+
+    odds        = _to_float(p.get("odds")) or 0.0
+    is_correct  = bool(v.get("is_correct"))
+    stake_pct   = p.get("stake_pct")
+
+    frac = _as_fraction(stake_pct)
+    if frac <= 0:
+        frac = _as_fraction(DEFAULT_UNIT_PCT)
+
+    stake_amount = _safe_round_money(max(MIN_STAKE_AMOUNT, bankroll_before * frac)) if frac > 0 else 0.0
+    profit = _safe_round_money(stake_amount * (odds - 1.0)) if is_correct else _safe_round_money(-stake_amount)
+    after  = _safe_round_money(bankroll_before + profit)
+
+    row = {
+        "id": str(uuid.uuid4()),
+        "label": label,
+        "prediction_id": p["id"],
+        "fixture_id": p.get("fixture_id"),
+        "verified_at": verified_at,
+        "date": date_str,
+        "market": p.get("market"),
+        "prediction": p.get("prediction"),
+        "odds": odds,
+        "stake_pct": float(frac * 100.0),  # store as percentage number for readability (e.g., 1.5)
+        "stake_amount": stake_amount,
+        "result": "win" if is_correct else "lose",
+        "profit": profit,
+        "bankroll_before": bankroll_before,
+        "bankroll_after": after,
+        "created_at": _now_iso(),
+    }
+    return after, row
+
+def rebuild_or_append():
     print("=== bankroll_log updater starting ===")
-    print(f"Settings: LABEL={LABEL} START_DATE={START_DATE} EXCLUDE={sorted(EXCLUDE_DATES) if EXCLUDE_DATES else '[]'}")
-    print(f"Filters: CONF>={CONF_MIN} ODDS[{ODDS_MIN},{ODDS_MAX}] ONLY_MARKETS={ONLY_MARKETS or 'ALL'}")
+    print(f"LABEL={LABEL}  REBUILD={REBUILD}  DEFAULT_BANKROLL={DEFAULT_BANKROLL:.2f}  DEFAULT_UNIT_PCT={DEFAULT_UNIT_PCT}%  MIN_STAKE={MIN_STAKE_AMOUNT:.2f}")
+    print(f"Filters: PO_VALUE_ONLY={PO_VALUE_ONLY}  CONF>={CONF_MIN}  ODDS[{ODDS_MIN},{ODDS_MAX}]  MARKETS={ONLY_MARKETS or 'ALL'}")
 
-    # A) Determine starting bankroll
-    bankroll = _read_state_bankroll(LABEL)
-    if bankroll is None:
-        bankroll = _read_last_bankroll_from_log()
-    if bankroll is None:
-        bankroll = DEFAULT_BANKROLL
-    bankroll = float(bankroll)
-    print(f"A) starting bankroll: {bankroll:.2f}")
-
-    # B) Get existing logged prediction_ids
-    logged_ids = _existing_logged_prediction_ids()
-    print(f"B) already logged prediction_ids: {len(logged_ids)}")
-
-    # C) Load verifications window
-    verifs_raw = _load_verifications_since(START_DATE)
-    print(f"C) verifications fetched: {len(verifs_raw)}")
-
-    # D) Filter verifications: has pid, not excluded by date, not already logged
-    verifs = []
-    excl_dates = 0
-    for v in verifs_raw:
-        pid = v.get("prediction_id")
-        ts  = v.get("verified_at")
-        if not pid or not ts:
-            continue
-        d = ts.split("T", 1)[0]
-        if d in EXCLUDE_DATES:
-            excl_dates += 1
-            continue
-        if pid in logged_ids:
-            continue
-        verifs.append(v)
-    print(f"D) after filters: {len(verifs)} (excluded_by_date={excl_dates}, new_ids={len({v['prediction_id'] for v in verifs})})")
+    # Load all verifications in chronological order
+    verifs = _load_all_verifications_sorted()
     if not verifs:
-        print("Nothing new to process.")
+        print("No verifications found. Nothing to do.")
         return
 
-    # E) Load matching predictions (with filters) in batches
-    pred_ids = list({v["prediction_id"] for v in verifs})
-    preds = _load_predictions_by_ids(pred_ids)
+    # Load predictions for these verifications (apply filters)
+    pid_list = [v["prediction_id"] for v in verifs if v.get("prediction_id")]
+    preds = _load_predictions_for_ids(pid_list)
     if not preds:
-        print("E) no predictions match filters (po_value=true, conf/odds range, market). Nothing to do.")
+        print("No matching predictions after filters. Nothing to do.")
         return
-    print(f"E) loaded predictions passing filters: {len(preds)}")
 
-    # F) Sort verifications chronologically ASC for compounding
-    verifs.sort(key=lambda v: v["verified_at"])
+    # If REBUILD: delete this label’s rows and start from DEFAULT_BANKROLL
+    bankroll = None
+    if REBUILD:
+        deleted = _delete_rows_for_label(LABEL)
+        print(f"[REBUILD] Deleted {deleted} previous rows for label='{LABEL}'.")
+        bankroll = DEFAULT_BANKROLL
+    else:
+        bankroll = _read_last_bankroll_state(LABEL)
+        if bankroll is None:
+            bankroll = DEFAULT_BANKROLL
+        print(f"Starting bankroll: {bankroll:.2f}")
 
-    logs_to_insert: List[Dict[str, Any]] = []
-    current_bankroll = round(bankroll, 2)
-
-    kept = 0
-    skipped_no_pred = 0
-    skipped_bad_stake = 0
+    # Compose rows
+    rows_to_write: List[Dict[str, Any]] = []
+    used_ids: Set[str] = set()
 
     for v in verifs:
-        pid = v["prediction_id"]
-        pred = preds.get(pid)
-        if not pred:
-            skipped_no_pred += 1
+        pid = v.get("prediction_id")
+        if not pid or pid in used_ids:
+            continue
+        p = preds.get(pid)
+        if not p:
             continue
 
-        stake_pct = _to_float(pred.get("stake_pct"))
-        odds      = _to_float(pred.get("odds"))
-        conf      = _to_float(pred.get("confidence_pct"))
-        po_value  = bool(pred.get("po_value"))
+        bankroll, row = _compute_row(bankroll, v, p, LABEL)
+        rows_to_write.append(row)
+        used_ids.add(pid)
 
-        # safety: ensure stake/odds/conf/povalue still valid
-        if stake_pct is None or stake_pct <= 0:
-            skipped_bad_stake += 1
-            continue
-        if odds is None or not (ODDS_MIN <= odds <= ODDS_MAX):
-            continue
-        if conf is None or conf < CONF_MIN:
-            continue
-        if not po_value:
-            continue
+        # Write in chunks to avoid large payloads
+        if len(rows_to_write) >= 1000:
+            ok = _upsert_logs(rows_to_write)
+            if not ok:
+                print("Batch upsert failed; stopping early.")
+                break
+            rows_to_write = []
 
-        is_correct = bool(v.get("is_correct"))
-
-        frac = _stake_fraction(stake_pct)
-        if frac <= 0:
-            skipped_bad_stake += 1
-            continue
-
-        stake_amount = round(frac * current_bankroll, 2)
-        profit = round(stake_amount * (odds - 1.0), 2) if is_correct else round(-stake_amount, 2)
-        after  = round(current_bankroll + profit, 2)
-
-        # minimal columns (keep schema-agnostic)
-        row = {
-            "id": str(uuid.uuid4()),
-            "prediction_id": pid,
-            "date": v["verified_at"].split("T")[0],
-            "stake_amount": stake_amount,
-            "odds": round(odds, 2),
-            "result": "win" if is_correct else "lose",
-            "profit": profit,
-            "starting_bankroll": current_bankroll,
-            "bankroll_after": after,
-            # created_at helps ordering if column exists
-            "created_at": _now_iso(),
-        }
-
-        logs_to_insert.append(row)
-        current_bankroll = after
-        kept += 1
-
-    print(f"F) ready to upsert: {len(logs_to_insert)} (kept={kept}, skipped_no_pred={skipped_no_pred}, skipped_bad_stake={skipped_bad_stake})")
-    if not logs_to_insert:
-        print("All new verifications were filtered out by rules.")
-        return
-
-    # G) Upsert by prediction_id (idempotent). If created_at column doesn't exist, retry without it.
-    def _upsert(rows: List[Dict[str, Any]], include_created_at: bool) -> bool:
-        payload = rows if include_created_at else [{k:v for k,v in r.items() if k != "created_at"} for r in rows]
-        try:
-            supabase.table("bankroll_log").upsert(payload, on_conflict="prediction_id").execute()
-            return True
-        except Exception as e:
-            print(f"G) upsert failed ({'with' if include_created_at else 'without'} created_at): {e}")
-            return False
-
-    ok = _upsert(logs_to_insert, include_created_at=True)
-    if not ok:
-        ok = _upsert(logs_to_insert, include_created_at=False)
+    # Final flush
+    if rows_to_write:
+        ok = _upsert_logs(rows_to_write)
         if not ok:
-            print("G) both upserts failed. Aborting.")
+            print("Final upsert failed.")
             return
-        else:
-            print("G) upsert succeeded without created_at.")
 
-    print(f"G) upserted rows: {len(logs_to_insert)}")
+    # Persist current bankroll
+    _write_state_bankroll(LABEL, bankroll)
 
-    # H) Persist snapshot for next run
-    _write_state_bankroll(LABEL, current_bankroll)
+    print(f"✅ Done. Final bankroll for '{LABEL}': {bankroll:.2f}")
 
-    # I) Console feedback
-    for log in logs_to_insert[-10:]:
-        print(f"✅ {log['result']:4} | {log['date']} | {log['starting_bankroll']} → {log['bankroll_after']} (pid={log['prediction_id']})")
-
-    print(f"=== bankroll_log updater complete — final bankroll: {current_bankroll:.2f} ===")
+# =============================================================================
+# CLI
+# =============================================================================
+if __name__ == "__main__":
+    rebuild_or_append()
