@@ -1,169 +1,192 @@
 # utils/settle_results.py
+from __future__ import annotations
+
 import os
-import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-SB_URL = os.getenv("SUPABASE_URL")
-SB_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-VP_TABLE = os.getenv("VALUE_PREDICTIONS_TABLE", "value_predictions")
-VER_TABLE = os.getenv("VERIFICATIONS_TABLE", "verifications")
-MARKET = os.getenv("MARKET_NAME", "over_2_5")  # settle OU 2.5
+from utils.supabaseClient import supabase
 
-if not SB_URL or not SB_KEY:
-    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/ANON_KEY")
+# Reuse API-Football credentials
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
+BASE_URL = os.getenv("FOOTBALL_BASE_URL", "https://v3.football.api-sports.io")
+HEADERS = {"x-apisports-key": FOOTBALL_API_KEY} if FOOTBALL_API_KEY else {}
 
-HDRS = {
-    "apikey": SB_KEY,
-    "Authorization": f"Bearer {SB_KEY}",
-    "Content-Type": "application/json",
-}
+APP_TZ = os.getenv("APP_TZ", "UTC")
+logger = logging.getLogger(__name__)
 
-# Use your existing fetcher for fixtures
-try:
-    from utils.get_football_data import fetch_fixtures
-except Exception as e:
-    raise ImportError("utils.get_football_data.fetch_fixtures is required for settlement") from e
+# ---- HTTP (independent of utils.safe_get to avoid signature mismatches) ----
+def _http_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    try:
+        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        if r.status_code != 200:
+            logger.warning(f"[settle] GET {url} -> {r.status_code} {r.text[:150]}")
+            return None
+        return r.json()
+    except Exception as e:
+        logger.warning(f"[settle] GET failed {url}: {e}")
+        return None
 
+# ---- API-Football helpers ---------------------------------------------------
+def _fetch_fixtures_for_date(date_str: str) -> List[Dict[str, Any]]:
+    """Return fixtures (with scores & status) for YYYY-MM-DD."""
+    url = f"{BASE_URL}/fixtures"
+    data = _http_get(url, params={"date": date_str}) or {}
+    return data.get("response", []) or []
 
+def _fixture_result_from_api_node(node: Dict[str, Any]) -> Optional[Tuple[int, int, int, str]]:
+    """
+    From one API-Football fixture node, return:
+      (goals_home, goals_away, total_goals, status_short) or None if not finished.
+    """
+    try:
+        status = (((node.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if status not in ("FT", "AET", "PEN", "ABD", "AWD", "WO"):
+            return None
+        goals = node.get("goals") or {}
+        gh = int(goals.get("home") or 0)
+        ga = int(goals.get("away") or 0)
+        tot = gh + ga
+        return gh, ga, tot, status
+    except Exception:
+        return None
+
+# ---- Supabase helpers -------------------------------------------------------
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
-def _pg_get(path: str, params: Dict[str, Any]) -> requests.Response:
-    return requests.get(f"{SB_URL.rstrip('/')}{path}", headers=HDRS, params=params, timeout=25)
-
-
-def _verifications_upsert(payload_row: Dict[str, Any]) -> bool:
-    params = {"on_conflict": "prediction_id"}
-    headers = dict(HDRS)
-    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-    r = requests.post(
-        f"{SB_URL.rstrip('/')}/rest/v1/{VER_TABLE}",
-        headers=headers,
-        params=params,
-        data=json.dumps([payload_row]),
-        timeout=25,
-    )
-    if r.status_code >= 400:
-        logging.error(f"[settle] UPSERT {VER_TABLE} failed: {r.status_code} {r.text}")
-        return False
-    return True
-
-
-def _get_latest_prediction_row(fixture_id: int, market: str = MARKET) -> Optional[Dict[str, Any]]:
-    params = {
-        "fixture_id": f"eq.{fixture_id}",
-        "market": f"eq.{market}",
-        "select": "id,fixture_id,market,prediction,odds,confidence_pct,created_at",
-        "order": "created_at.desc",
-        "limit": "1",
-    }
-    r = _pg_get(f"/rest/v1/{VP_TABLE}", params)
-    if r.status_code >= 400:
-        logging.error(f"[settle] GET {VP_TABLE} failed: {r.status_code} {r.text}")
-        return None
-    rows = r.json()
-    return rows[0] if rows else None
-
-
-def _is_finished(fx: Dict[str, Any]) -> bool:
-    status = (((fx or {}).get("fixture") or {}).get("status") or {}).get("short")
-    return status in {"FT", "AET", "PEN"}
-
-
-def _goals_home_away(fx: Dict[str, Any]) -> Optional[tuple[int, int]]:
-    goals = (fx or {}).get("goals") or {}
+def _select_predictions_for_fixture(fid: int) -> List[Dict[str, Any]]:
+    """All value_predictions rows for a fixture (any markets)."""
     try:
-        gh = int(goals.get("home") or 0)
-        ga = int(goals.get("away") or 0)
-        return gh, ga
-    except Exception:
-        score = (fx or {}).get("score") or {}
-        ft = score.get("fulltime") or {}
-        try:
-            gh = int(ft.get("home") or 0)
-            ga = int(ft.get("away") or 0)
-            return gh, ga
-        except Exception:
-            return None
+        r = supabase.table("value_predictions").select(
+            "id, fixture_id, market, prediction, odds"
+        ).eq("fixture_id", fid).execute()
+        return getattr(r, "data", None) or []
+    except Exception as e:
+        logger.warning(f"[settle] load predictions failed for {fid}: {e}")
+        return []
 
+def _upsert_verification(rows: List[Dict[str, Any]]) -> bool:
+    """
+    Upsert into verifications on conflict 'prediction_id'.
+    This avoids the 409 duplicate PK error you saw earlier.
+    """
+    try:
+        supabase.table("verifications").upsert(
+            rows, on_conflict="prediction_id"
+        ).execute()
+        return True
+    except Exception as e:
+        logger.error(f"[settle] POST/UPSERT verifications failed: {e}")
+        return False
 
-def _result_side_from_total(total: Optional[int]) -> Optional[str]:
-    if total is None:
-        return None
-    return "Over" if total > 2 else "Under"  # OU 2.5 threshold
+def _try_patch_value_predictions_result(pid: str, patch: Dict[str, Any]) -> None:
+    """
+    Best-effort patch back into value_predictions (only if those columns exist).
+    We swallow 400 PGRST204 'column not in schema cache' errors.
+    """
+    try:
+        supabase.table("value_predictions").update(patch).eq("id", pid).execute()
+    except Exception as e:
+        msg = str(e)
+        if "PGRST204" in msg or "column" in msg.lower():
+            logger.info(f"[settle] PATCH value_predictions ignored or failed (maybe columns not present): {msg[:200]}")
+        else:
+            logger.warning(f"[settle] PATCH value_predictions failed: {msg[:200]}")
 
-
-def _teams(fx: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-    teams = (fx or {}).get("teams") or {}
-    return ( (teams.get("home") or {}).get("name"),
-             (teams.get("away") or {}).get("name") )
-
+# ---- Core settlement --------------------------------------------------------
+def _ou25_is_correct(pick: str, total_goals: int) -> Optional[bool]:
+    p = (pick or "").strip().lower()
+    if p == "over":
+        return total_goals >= 3
+    if p == "under":
+        return total_goals <= 2
+    return None
 
 def settle_date(date_str: str) -> int:
     """
-    Settle all finished fixtures for the given YYYY-MM-DD date.
-    Writes/updates verifications with:
-      prediction_id (PK), is_correct, fixture_id, home_team, away_team,
-      goals_home, goals_away, result_goals, result_side, settled_at.
+    Verify & upsert results for all finished fixtures of the given day (YYYY-MM-DD).
+    Returns number of verifications written.
     """
-    try:
-        fixtures: List[Dict[str, Any]] = fetch_fixtures(date_str) or []
-    except Exception as e:
-        logging.error(f"[settle] fetch_fixtures failed for {date_str}: {e}")
+    fixtures = _fetch_fixtures_for_date(date_str)
+    if not fixtures:
+        logger.info(f"[settle] No fixtures from API for {date_str}")
         return 0
 
-    updated = 0
-    for fx in fixtures:
-        try:
-            if not _is_finished(fx):
+    # Map fixture_id -> result tuple
+    finished: Dict[int, Tuple[int,int,int,str]] = {}
+    for n in fixtures:
+        fid = ((n.get("fixture") or {}).get("id")) or None
+        if not isinstance(fid, int):
+            continue
+        res = _fixture_result_from_api_node(n)
+        if res is None:
+            continue
+        finished[fid] = res
+
+    if not finished:
+        logger.info(f"[settle] No finished fixtures for {date_str}")
+        return 0
+
+    total_written = 0
+    batch_verifs: List[Dict[str, Any]] = []
+
+    for fid, (gh, ga, tot, status) in finished.items():
+        preds = _select_predictions_for_fixture(fid)
+        if not preds:
+            continue
+
+        for p in preds:
+            pid   = p.get("id")
+            pick  = (p.get("prediction") or "").strip()
+            market= (p.get("market") or "").strip().lower()
+
+            if not pid:
+                continue
+            if market != "over_2_5":
+                # You can extend this later for BTTS/1X2
                 continue
 
-            fixture_id = ((fx.get("fixture") or {}).get("id"))
-            if not fixture_id:
+            is_correct = _ou25_is_correct(pick, tot)
+            if is_correct is None:
                 continue
 
-            ghga = _goals_home_away(fx)
-            if not ghga:
-                logging.info(f"[settle] Fixture {fixture_id} finished but no goals found; skipping.")
-                continue
-            gh, ga = ghga
-            total = gh + ga
-            side = _result_side_from_total(total)
-
-            home_name, away_name = _teams(fx)
-            vp = _get_latest_prediction_row(fixture_id, MARKET)
-            if not vp:
-                continue
-
-            pick = (vp.get("prediction") or "").strip()
-            pred_id = vp.get("id")
-            won = (pick == side)
-
-            payload = {
-                "prediction_id": pred_id,
-                "is_correct": won,
-                "fixture_id": fixture_id,
-                "home_team": home_name,
-                "away_team": away_name,
+            row = {
+                "prediction_id": pid,
+                "fixture_id": fid,
+                "verified_at": _now_iso(),
+                "is_correct": bool(is_correct),
+                # write expanded result fields if the table has them (safe to upsert anyway)
                 "goals_home": gh,
                 "goals_away": ga,
-                "result_goals": total,
-                "result_side": side,
-                "settled_at": _now_iso(),
+                "total_goals": tot,
+                "status": status,
+                "market": "over_2_5",
+                "pick": pick,
             }
+            batch_verifs.append(row)
 
-            if pred_id and _verifications_upsert(payload):
-                updated += 1
-                logging.info(
-                    f"[settle] ✅ {home_name} {gh}-{ga} {away_name} (#{fixture_id}) | side={side} pick={pick} won={won}"
-                )
+            # (Optional) also write the outcome back to value_predictions if columns exist
+            _try_patch_value_predictions_result(pid, {
+                "is_correct": bool(is_correct),
+                "result": "win" if is_correct else "lose",
+                "goals_home": gh,
+                "goals_away": ga,
+                "total_goals": tot,
+            })
 
-        except Exception as e:
-            logging.error(f"[settle] error: {e}")
+        # Flush periodically to keep payloads small
+        if len(batch_verifs) >= 500:
+            if _upsert_verification(batch_verifs):
+                total_written += len(batch_verifs)
+            batch_verifs = []
 
-    return updated
+    # Final flush
+    if batch_verifs:
+        if _upsert_verification(batch_verifs):
+            total_written += len(batch_verifs)
+
+    return total_written
