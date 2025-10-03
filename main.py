@@ -16,8 +16,9 @@ logging.basicConfig(
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-APP_TZ = os.getenv("APP_TZ", "UTC")              # e.g. "America/Los_Angeles"
+APP_TZ = os.getenv("APP_TZ", "UTC")                  # e.g. "America/Los_Angeles"
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "1"))  # process today + N days ahead
+SETTLE_FIRST = os.getenv("SETTLE_FIRST", "true").lower() in ("1", "true", "yes", "y")
 
 ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
 PREFERRED_BOOK = os.getenv("PREF_BOOK", "Bwin")
@@ -137,7 +138,7 @@ def _choose_ou_odds(fx: Dict[str, Any], fixture_id: Optional[int]) -> Dict[str, 
 def _prediction_exists(fid: int, market: str = "over_2_5") -> bool:
     """
     Returns True if a value_predictions row exists for (fixture_id, market).
-    Keeps API/compute low by skipping already-processed fixtures.
+    Keeps work low by skipping already-processed fixtures.
     """
     if not _HAS_SUPABASE:
         return False
@@ -269,7 +270,7 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     # 1) Enrich (if available)
     fx_enriched = enrich_fixture_safe(fx_raw, preferred_bookmaker=PREFERRED_BOOK)
 
-    # 2) Upsert the match row (persists enriched JSONB blocks into matches table)
+    # 2) Upsert the match row
     try:
         ok = insert_match(fx_enriched)
         if not ok:
@@ -277,7 +278,7 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     except Exception as e:
         logging.error(f"❌ insert_match failed for fixture {fixture_id}: {e}")
 
-    # 3) Build payload with richer context and odds
+    # 3) Build payload
     payload = _build_payload_from_enriched(fx_enriched, ODDS_SOURCE)
 
     # Require at least one OU2.5 price to proceed
@@ -300,10 +301,10 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     pred.setdefault("fixture_id", fixture_id)
     pred.setdefault("market", "over_2_5")
 
-    # 5) Optional inversion (disabled by default)
+    # 5) Optional inversion
     final_pred = _maybe_invert(pred, payload.get("odds") or {})
 
-    # 6) Store prediction in value_predictions
+    # 6) Store prediction
     try:
         count, msg = insert_value_predictions(final_pred, odds_source=ODDS_SOURCE)
         if count:
@@ -367,6 +368,22 @@ def _fetch_single_fixture_stub(fixture_id: int) -> Dict[str, Any]:
 if __name__ == "__main__":
     argv_ids = _parse_fixture_ids_from_argv(sys.argv[1:])
 
+    # --- NEW: settle FIRST (today, yesterday, day-2) -------------------------
+    if _HAS_SETTLER and SETTLE_FIRST:
+        try:
+            d0 = _today_str_app()
+            d1 = _date_str_app_days_ago(1)
+            d2 = _date_str_app_days_ago(2)
+            n1 = settle_date(d1)  # verify yesterday first (most likely finished)
+            n0 = settle_date(d0)  # then today (catch early finishes)
+            n2 = settle_date(d2)  # and day-2 (late corrections)
+            logging.info(f"✅ [settle-first] {d1}: {n1} | {d0}: {n0} | {d2}: {n2}")
+        except Exception as e:
+            logging.warning(f"Result settlement (pre) failed: {e}")
+    else:
+        logging.info("Settle-first disabled or module missing; proceeding to predictions.")
+
+    # --- Predictions ----------------------------------------------------------
     if argv_ids:
         for fid in argv_ids:
             fx = _fetch_single_fixture_stub(fid)
@@ -378,8 +395,8 @@ if __name__ == "__main__":
             ds = _date_str_app_days_ahead(d)
             _process_fixtures_for_date(ds)
 
-    # --- Result settlement (today, yesterday, day-2) ---
-    if _HAS_SETTLER:
+    # --- OPTIONAL: settle again after predictions (safeguard) ----------------
+    if _HAS_SETTLER and not SETTLE_FIRST:
         try:
             d0 = _today_str_app()
             d1 = _date_str_app_days_ago(1)
@@ -387,10 +404,6 @@ if __name__ == "__main__":
             n0 = settle_date(d0)
             n1 = settle_date(d1)
             n2 = settle_date(d2)
-            logging.info(f"✅ Settled {n0} results for {d0}")
-            logging.info(f"✅ Settled {n1} results for {d1}")
-            logging.info(f"✅ Settled {n2} results for {d2}")
+            logging.info(f"✅ [settle-post] {d0}: {n0} | {d1}: {n1} | {d2}: {n2}")
         except Exception as e:
-            logging.warning(f"Result settlement failed: {e}")
-    else:
-        logging.info("Result settlement skipped (module not available).")
+            logging.warning(f"Result settlement (post) failed: {e}")
