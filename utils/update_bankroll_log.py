@@ -14,7 +14,7 @@ from utils.supabaseClient import supabase
 # =============================================================================
 LABEL               = os.getenv("BANKROLL_LABEL", "default")
 DEFAULT_BANKROLL    = float(os.getenv("BANKROLL_START", "1000"))      # starting bankroll for REBUILD
-BANKROLL_UNIT_PCT   = float(os.getenv("BANKROLL_UNIT_PCT", "1.0"))    # e.g. 1.0 = 1% of bankroll per bet
+BANKROLL_UNIT_PCT   = float(os.getenv("BANKROLL_UNIT_PCT", "3.0"))    # e.g. 3.0 = 3% of bankroll per bet
 MIN_STAKE_AMOUNT    = float(os.getenv("BANKROLL_MIN_STAKE", "0.10"))  # avoid 0 after rounding
 REBUILD             = os.getenv("BANKROLL_REBUILD", "false").lower() in ("1","true","yes","y")
 
