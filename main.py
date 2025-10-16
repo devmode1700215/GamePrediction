@@ -2,7 +2,7 @@
 import os
 import sys
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 # -----------------------------------------------------------------------------
@@ -14,19 +14,22 @@ logging.basicConfig(
 )
 
 # -----------------------------------------------------------------------------
-# Config
+# Config (env flags)
 # -----------------------------------------------------------------------------
-APP_TZ = os.getenv("APP_TZ", "UTC")                        # e.g. "America/Los_Angeles"
-LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "1"))     # process today + N days ahead
+APP_TZ = os.getenv("APP_TZ", "UTC")                     # e.g. "America/Los_Angeles"
+LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "1"))  # process today + N days ahead
 SETTLE_FIRST = os.getenv("SETTLE_FIRST", "true").lower() in ("1", "true", "yes", "y")
 
 ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
 PREFERRED_BOOK = os.getenv("PREF_BOOK", "Bwin")
 INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
 
-# Run bankroll & top10 updates
+# Run helpers
 RUN_BANKROLL_UPDATE = os.getenv("RUN_BANKROLL_UPDATE", "true").lower() in ("1","true","yes","y")
 RUN_TOP10_UPDATE    = os.getenv("RUN_TOP10_UPDATE", "true").lower() in ("1","true","yes","y")
+
+# Optional Top10 backfill flags (picked up if set)
+TOP10_BACKFILL_ALL  = os.getenv("TOP10_BACKFILL_ALL", "false").lower() in ("1","true","yes","y")
 
 # -----------------------------------------------------------------------------
 # Repo utils
@@ -90,17 +93,21 @@ except Exception as _e:
     logging.info(f"Result settlement module not found (utils.settle_results): {_e}")
     _HAS_SETTLER = False
 
-# Bankroll updater (compounding %)
+# Bankroll updaters (compounding, full + top10 ledgers)
 try:
-    from utils.update_bankroll_log import rebuild_or_append as _update_bankroll_log
+    from utils.update_bankroll_log import update_bankroll_full, update_bankroll_top10
     _HAS_BANKROLL = True
 except Exception as _e:
-    logging.info(f"Bankroll updater not available (utils.update_bankroll_log): {_e}")
+    logging.info(f"Bankroll updaters not available (utils.update_bankroll_log): {_e}")
     _HAS_BANKROLL = False
 
-# Top-10 updater (daily)
+# Top-10 updater (daily + result sync; optional backfill)
 try:
-    from utils.update_top10_predictions import compute_top10_for_date as _top10_for_date
+    from utils.update_top10_predictions import (
+        compute_top10_for_date as _top10_for_date,
+        sync_results_for_all as _top10_sync_results,
+        backfill_all as _top10_backfill_all,
+    )
     _HAS_TOP10 = True
 except Exception as _e:
     logging.info(f"Top10 updater not available (utils.update_top10_predictions): {_e}")
@@ -126,7 +133,7 @@ def _today_str_app() -> str:
     return _now_app().strftime("%Y-%m-%d")
 
 def _today_utc_ds() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # -----------------------------------------------------------------------------
 # Odds selector for OU2.5 (prefer enriched market if present)
@@ -396,22 +403,31 @@ if __name__ == "__main__":
     else:
         logging.info("Settle-first disabled or module missing; proceeding.")
 
-    # --- 2) Update bankroll_log right after settlement -----------------------
+    # --- 2) Update bankroll logs right after settlement ----------------------
     if _HAS_BANKROLL and RUN_BANKROLL_UPDATE:
         try:
-            logging.info("▶ Updating bankroll_log (compounding)…")
-            _update_bankroll_log()
-            logging.info("✅ bankroll_log updated.")
+            logging.info("▶ Updating bankroll logs (compounding)…")
+            # Full ledger (all verified preds by your filters)
+            update_bankroll_full(label="bankroll_full")
+            # Top-10-only ledger (only predictions that were in top10 snapshots)
+            update_bankroll_top10(label="bankroll_top10")
+            logging.info("✅ bankroll logs updated.")
         except Exception as e:
-            logging.warning(f"bankroll_log update failed: {e}")
+            logging.warning(f"bankroll logs update failed: {e}")
 
-    # --- 3) Update Top-10 (UTC today) ---------------------------------------
+    # --- 3) Update Top-10 (UTC today) or backfill if flagged -----------------
     if _HAS_TOP10 and RUN_TOP10_UPDATE:
         try:
-            ds_utc = _today_utc_ds()
-            logging.info(f"▶ Updating Top10 for {ds_utc} (UTC)…")
-            _ = _top10_for_date(ds_utc)
-            logging.info("✅ Top10 updated.")
+            if TOP10_BACKFILL_ALL:
+                logging.info("▶ Top10 backfill over all available dates…")
+                _top10_backfill_all()
+            else:
+                ds_utc = _today_utc_ds()
+                logging.info(f"▶ Updating Top10 for {ds_utc} (UTC)…")
+                _ = _top10_for_date(ds_utc)
+            # Always try to sync results after computing
+            _top10_sync_results()
+            logging.info("✅ Top10 updated & results synced.")
         except Exception as e:
             logging.warning(f"Top10 update failed: {e}")
 
