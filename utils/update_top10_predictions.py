@@ -4,18 +4,18 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils.supabaseClient import supabase
 
 # ----------------------------
 # Config (ENV overrides)
 # ----------------------------
-ONLY_MARKET       = os.getenv("TOP10_ONLY_MARKET", "over_2_5")  # market considered
+ONLY_MARKET       = os.getenv("TOP10_ONLY_MARKET", "over_2_5")   # market considered
 ONLY_PO_VALUE     = os.getenv("TOP10_ONLY_PO_VALUE", "true").lower() in ("1","true","yes","y")
-TOPK              = int(os.getenv("TOP10_K", "10"))             # top K per day
-STAKE_AMOUNT      = float(os.getenv("TOP10_STAKE_AMOUNT", "5")) # fixed stake per pick
-BACKFILL_START    = os.getenv("TOP10_BACKFILL_START", None)     # e.g. "2025-09-01"
+TOPK              = int(os.getenv("TOP10_K", "10"))              # top K per day
+STAKE_AMOUNT      = float(os.getenv("TOP10_STAKE_AMOUNT", "5"))  # fixed stake per pick
+BACKFILL_START    = os.getenv("TOP10_BACKFILL_START", None)      # e.g. "2025-09-01"
 BACKFILL_ALL      = os.getenv("TOP10_BACKFILL_ALL", "false").lower() in ("1","true","yes","y")
 BATCH_SIZE        = int(os.getenv("TOP10_BATCH_SIZE", "800"))
 
@@ -42,11 +42,11 @@ def _distinct(a):
     return list(dict.fromkeys(a))
 
 # ----------------------------
-# Data access
+# Low-level data access
 # ----------------------------
-def _fixture_ids_for_date(date_str: str) -> List[int]:
+def _fixture_ids_for_date_via_matches(date_str: str) -> List[int]:
     """
-    Use a UTC day window so it works whether 'matches.date' is timestamptz or ISO text.
+    Prefer using matches.date as a UTC-day window. If matches.date is DATE, this still works.
     """
     start, end = _day_bounds_utc(date_str)
     try:
@@ -113,38 +113,77 @@ def _upsert_top10(date_str: str, rows: List[Dict[str, Any]]) -> bool:
         rr.setdefault("stake_amount", STAKE_AMOUNT)
         payload.append(rr)
     try:
-        supabase.table("top10_predictions").upsert(payload, on_conflict="date,rank,prediction_id").execute()
+        # Requires a unique constraint on (date, rank, prediction_id)
+        supabase.table("top10_predictions").upsert(
+            payload, on_conflict="date,rank,prediction_id"
+        ).execute()
         return True
     except Exception as e:
         print(f"[top10] upsert failed for {date_str}: {e}")
         return False
 
-def _distinct_match_dates() -> List[str]:
-    """
-    Distinct UTC dates derived from matches.date using day windows.
-    """
+# ----------------------------
+# Backfill helpers (robust): get dates from value_predictions + matches
+# ----------------------------
+def _all_fixture_ids_from_value_predictions() -> List[int]:
     try:
-        res = supabase.table("matches").select("date").order("date", desc=False).limit(200000).execute()
+        res = supabase.table("value_predictions").select("fixture_id").limit(500000).execute()
         rows = getattr(res, "data", None) or []
-        ds = set()
-        for r in rows:
-            iso = r.get("date")
-            if not iso:
-                continue
-            try:
-                dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(timezone.utc)
-                ds.add(dt.strftime("%Y-%m-%d"))
-            except Exception:
-                continue
-        return sorted(ds)
+        return [int(r["fixture_id"]) for r in rows if r.get("fixture_id") is not None]
     except Exception:
         return []
 
+def _fixture_dates_map(fixture_ids: List[int]) -> Dict[int, str]:
+    """
+    Map fixture_id -> YYYY-MM-DD (UTC) using matches.date, in batches.
+    """
+    out: Dict[int, str] = {}
+    for i in range(0, len(fixture_ids), BATCH_SIZE):
+        chunk = fixture_ids[i:i+BATCH_SIZE]
+        try:
+            res = (
+                supabase.table("matches")
+                .select("fixture_id, date")
+                .in_("fixture_id", chunk)
+                .execute()
+            )
+            rows = getattr(res, "data", None) or []
+            for r in rows:
+                fid = r.get("fixture_id")
+                ds  = r.get("date")
+                if not fid or not ds:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(str(ds).replace("Z", "+00:00")).astimezone(timezone.utc)
+                    out[int(fid)] = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    # if it's a plain YYYY-MM-DD (DATE type), accept directly
+                    out[int(fid)] = str(ds)[:10]
+        except Exception:
+            continue
+    return out
+
+def _dates_from_value_predictions(backfill_start: Optional[str]) -> List[str]:
+    """
+    Build a sorted list of distinct dates by reading fixture_ids in value_predictions
+    and mapping them to matches.date. This is more robust than relying on matches alone.
+    """
+    fids = _all_fixture_ids_from_value_predictions()
+    if not fids:
+        return []
+    fmap = _fixture_dates_map(_distinct(fids))
+    ds_set = set(fmap.values())
+    if backfill_start:
+        ds_set = {d for d in ds_set if d >= backfill_start}
+    today = _today_utc_ds()
+    ds_set = {d for d in ds_set if d <= today}
+    return sorted(ds_set)
+
 # ----------------------------
-# Core: compute & store Top-10
+# Core: compute & store Top-10 for a specific date
 # ----------------------------
 def compute_top10_for_date(date_str: str) -> int:
-    fixture_ids = _fixture_ids_for_date(date_str)
+    fixture_ids = _fixture_ids_for_date_via_matches(date_str)
     if not fixture_ids:
         print(f"[top10] {date_str}: no fixtures in matches (window).")
         return 0
@@ -206,28 +245,26 @@ def compute_top10_for_date(date_str: str) -> int:
     else:
         return 0
 
+# ----------------------------
+# Backfill across all dates found in value_predictions->matches
+# ----------------------------
 def backfill_all():
-    all_dates = _distinct_match_dates()
+    all_dates = _dates_from_value_predictions(BACKFILL_START)
     if not all_dates:
-        print("[top10] no dates found to backfill.")
+        print("[top10] no dates found to backfill (from value_predictions).")
         return
-    if BACKFILL_START:
-        all_dates = [d for d in all_dates if d >= BACKFILL_START]
-    today = _today_utc_ds()
-    all_dates = [d for d in all_dates if d <= today]
-
     total = 0
     for ds in all_dates:
         total += compute_top10_for_date(ds)
     print(f"[top10] backfill complete, total rows written: {total}")
 
 # ----------------------------
-# Result sync (fills outcome + scores)
+# Result sync (UPDATE-by-id to avoid NOT NULL issues)
 # ----------------------------
 def _load_top10_rows_without_result(limit: int = 5000) -> List[Dict[str, Any]]:
     try:
         r = (supabase.table("top10_predictions")
-             .select("id, prediction_id, odds, stake_amount")
+             .select("id, date, prediction_id, odds, stake_amount")
              .is_("result", None)
              .limit(limit)
              .execute())
@@ -270,12 +307,17 @@ def sync_results_for_all() -> int:
     pid_list = _distinct([r["prediction_id"] for r in rows if r.get("prediction_id")])
     verifs = _load_verifications_for_pids(pid_list)
 
-    updates = []
+    updated = 0
     for r in rows:
-        pid = r.get("prediction_id")
+        row_id = r.get("id")
+        pid    = r.get("prediction_id")
+        if not row_id or not pid:
+            continue
+
         v = verifs.get(pid)
         if not v:
             continue
+
         is_correct = bool(v.get("is_correct"))
         odds  = float(r.get("odds") or 0)
         stake = float(r.get("stake_amount") or 0)
@@ -290,34 +332,29 @@ def sync_results_for_all() -> int:
             except Exception:
                 tg = None
 
-        updates.append({
-            "id": r["id"],
-            "verified_at": v.get("verified_at"),
-            "is_correct": is_correct,
-            "result": "win" if is_correct else "lose",
-            "outcome": "win" if is_correct else "lose",
-            "profit": profit,
-            "goals_home": gh,
-            "goals_away": ga,
-            "total_goals": tg,
-        })
+        try:
+            supabase.table("top10_predictions").update({
+                "verified_at": v.get("verified_at"),
+                "is_correct": is_correct,
+                "result": "win" if is_correct else "lose",
+                "outcome": "win" if is_correct else "lose",
+                "profit": profit,
+                "goals_home": gh,
+                "goals_away": ga,
+                "total_goals": tg,
+            }).eq("id", row_id).execute()
+            updated += 1
+        except Exception as e:
+            print(f"[top10] update failed for id={row_id}: {e}")
 
-    if not updates:
-        print("[top10] no matches between pending top10 and verifications.")
-        return 0
-
-    try:
-        supabase.table("top10_predictions").upsert(updates, on_conflict="id").execute()
-        print(f"[top10] synced results for {len(updates)} rows.")
-        return len(updates)
-    except Exception as e:
-        print(f"[top10] sync upsert failed: {e}")
-        return 0
+    print(f"[top10] synced results for {updated} rows.")
+    return updated
 
 # ----------------------------
 # CLI entry
 # ----------------------------
 if __name__ == "__main__":
+    print("✅ Supabase connection successful")
     if BACKFILL_ALL:
         backfill_all()
     else:
