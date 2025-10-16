@@ -16,13 +16,17 @@ logging.basicConfig(
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-APP_TZ = os.getenv("APP_TZ", "UTC")                  # e.g. "America/Los_Angeles"
-LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "1"))  # process today + N days ahead
+APP_TZ = os.getenv("APP_TZ", "UTC")                        # e.g. "America/Los_Angeles"
+LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "1"))     # process today + N days ahead
 SETTLE_FIRST = os.getenv("SETTLE_FIRST", "true").lower() in ("1", "true", "yes", "y")
 
 ODDS_SOURCE = os.getenv("ODDS_SOURCE", "apifootball")
 PREFERRED_BOOK = os.getenv("PREF_BOOK", "Bwin")
 INVERT_PREDICTIONS = os.getenv("INVERT_PREDICTIONS", "false").lower() in ("1", "true", "yes", "y")
+
+# Run bankroll & top10 updates
+RUN_BANKROLL_UPDATE = os.getenv("RUN_BANKROLL_UPDATE", "true").lower() in ("1","true","yes","y")
+RUN_TOP10_UPDATE    = os.getenv("RUN_TOP10_UPDATE", "true").lower() in ("1","true","yes","y")
 
 # -----------------------------------------------------------------------------
 # Repo utils
@@ -60,7 +64,7 @@ except Exception:
 
 from utils.insert_match import insert_match
 from utils.insert_value_predictions import insert_value_predictions
-from utils.get_prediction import get_prediction  # <- your weighted engine lives here
+from utils.get_prediction import get_prediction  # <- your weighted engine
 
 # Supabase client (for "exists?" checks)
 try:
@@ -86,6 +90,21 @@ except Exception as _e:
     logging.info(f"Result settlement module not found (utils.settle_results): {_e}")
     _HAS_SETTLER = False
 
+# Bankroll updater (compounding %)
+try:
+    from utils.update_bankroll_log import rebuild_or_append as _update_bankroll_log
+    _HAS_BANKROLL = True
+except Exception as _e:
+    logging.info(f"Bankroll updater not available (utils.update_bankroll_log): {_e}")
+    _HAS_BANKROLL = False
+
+# Top-10 updater (daily)
+try:
+    from utils.update_top10_predictions import compute_top10_for_date as _top10_for_date
+    _HAS_TOP10 = True
+except Exception as _e:
+    logging.info(f"Top10 updater not available (utils.update_top10_predictions): {_e}")
+    _HAS_TOP10 = False
 
 # -----------------------------------------------------------------------------
 # Time helpers
@@ -106,6 +125,8 @@ def _date_str_app_days_ahead(days: int) -> str:
 def _today_str_app() -> str:
     return _now_app().strftime("%Y-%m-%d")
 
+def _today_utc_ds() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
 
 # -----------------------------------------------------------------------------
 # Odds selector for OU2.5 (prefer enriched market if present)
@@ -131,7 +152,6 @@ def _choose_ou_odds(fx: Dict[str, Any], fixture_id: Optional[int]) -> Dict[str, 
 
     return {"over_2_5": odds_flat.get("over_2_5"), "under_2_5": odds_flat.get("under_2_5")}
 
-
 # -----------------------------------------------------------------------------
 # Pre-checks to reduce duplicate work
 # -----------------------------------------------------------------------------
@@ -156,7 +176,6 @@ def _prediction_exists(fid: int, market: str = "over_2_5") -> bool:
     except Exception as e:
         logging.info(f"exists-check failed for {fid}: {e}")
         return False
-
 
 # -----------------------------------------------------------------------------
 # Build prediction payload (matches your predictor)
@@ -236,7 +255,6 @@ def _build_payload_from_enriched(
     }
     return payload
 
-
 def _maybe_invert(pred: Dict[str, Any], odds_raw: Dict[str, Any]) -> Dict[str, Any]:
     if not INVERT_PREDICTIONS:
         logging.info("Inversion disabled: posting TRUE model prediction.")
@@ -251,7 +269,6 @@ def _maybe_invert(pred: Dict[str, Any], odds_raw: Dict[str, Any]) -> Dict[str, A
     except Exception as e:
         logging.warning(f"Inversion failed ({e}); posting TRUE prediction.")
         return pred
-
 
 # -----------------------------------------------------------------------------
 # Core processing
@@ -317,7 +334,6 @@ def _process_fixture(fx_raw: Dict[str, Any]) -> None:
     except Exception as e:
         logging.error(f"❌ insert_value_predictions failed for fixture {fixture_id}: {e}")
 
-
 def _process_fixtures_for_date(date_str: str) -> None:
     logging.info(f"▶ Processing fixtures for {date_str}")
     try:
@@ -338,7 +354,6 @@ def _process_fixtures_for_date(date_str: str) -> None:
             fid = (fx.get("fixture") or {}).get("id")
             logging.error(f"❌ Unhandled error on fixture {fid}: {e}")
 
-
 def _parse_fixture_ids_from_argv(argv: List[str]) -> List[int]:
     ids: List[int] = []
     for x in argv:
@@ -347,7 +362,6 @@ def _parse_fixture_ids_from_argv(argv: List[str]) -> List[int]:
         except Exception:
             logging.warning(f"Skipping non-integer fixture id arg: {x}")
     return ids
-
 
 def _fetch_single_fixture_stub(fixture_id: int) -> Dict[str, Any]:
     try:
@@ -361,14 +375,13 @@ def _fetch_single_fixture_stub(fixture_id: int) -> Dict[str, Any]:
         "odds": odds,
     }
 
-
 # -----------------------------------------------------------------------------
 # Entrypoint
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     argv_ids = _parse_fixture_ids_from_argv(sys.argv[1:])
 
-    # --- NEW: settle FIRST (today, yesterday, day-2) -------------------------
+    # --- 1) Settle FIRST (yesterday -> today -> day-2) -----------------------
     if _HAS_SETTLER and SETTLE_FIRST:
         try:
             d0 = _today_str_app()
@@ -381,9 +394,28 @@ if __name__ == "__main__":
         except Exception as e:
             logging.warning(f"Result settlement (pre) failed: {e}")
     else:
-        logging.info("Settle-first disabled or module missing; proceeding to predictions.")
+        logging.info("Settle-first disabled or module missing; proceeding.")
 
-    # --- Predictions ----------------------------------------------------------
+    # --- 2) Update bankroll_log right after settlement -----------------------
+    if _HAS_BANKROLL and RUN_BANKROLL_UPDATE:
+        try:
+            logging.info("▶ Updating bankroll_log (compounding)…")
+            _update_bankroll_log()
+            logging.info("✅ bankroll_log updated.")
+        except Exception as e:
+            logging.warning(f"bankroll_log update failed: {e}")
+
+    # --- 3) Update Top-10 (UTC today) ---------------------------------------
+    if _HAS_TOP10 and RUN_TOP10_UPDATE:
+        try:
+            ds_utc = _today_utc_ds()
+            logging.info(f"▶ Updating Top10 for {ds_utc} (UTC)…")
+            _ = _top10_for_date(ds_utc)
+            logging.info("✅ Top10 updated.")
+        except Exception as e:
+            logging.warning(f"Top10 update failed: {e}")
+
+    # --- 4) Then compute NEW predictions ------------------------------------
     if argv_ids:
         for fid in argv_ids:
             fx = _fetch_single_fixture_stub(fid)
@@ -395,7 +427,7 @@ if __name__ == "__main__":
             ds = _date_str_app_days_ahead(d)
             _process_fixtures_for_date(ds)
 
-    # --- OPTIONAL: settle again after predictions (safeguard) ----------------
+    # --- 5) Optional: settle again after predictions if not settled first ----
     if _HAS_SETTLER and not SETTLE_FIRST:
         try:
             d0 = _today_str_app()
