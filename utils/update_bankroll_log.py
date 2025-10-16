@@ -109,13 +109,14 @@ def _pass_filters(row: Dict[str, Any]) -> bool:
 # =============================================================================
 def _load_settled_rows(start_date: str) -> List[Dict[str, Any]]:
     """
-    Pull rows from value_predictions_with_result (singular) that are settled:
-      - is_correct is not null
-      - settled_at >= <start_date>T00:00:00Z
-    Order by settled_at ASC for stable compounding.
+    Load settled rows from value_predictions_with_result (singular).
+    Accept rows where is_correct is not null.
+    Use coalesce(settled_at, created_at) for date filtering and ordering,
+    so historical results without settled_at are included.
     """
     from_dt = f"{start_date}T00:00:00Z"
     try:
+        # Pull a generous window and filter in Python using coalesce
         r = (
             supabase.table(SRC_TABLE)
             .select(
@@ -123,12 +124,21 @@ def _load_settled_rows(start_date: str) -> List[Dict[str, Any]]:
                 "created_at, is_correct, home_team, away_team, result_side, result_goals, settled_at"
             )
             .not_.is_("is_correct", "null")
-            .gte("settled_at", from_dt)
-            .order("settled_at", desc=False)
-            .limit(50000)
+            .order("created_at", desc=False)   # stable pull; we’ll sort again after coalesce
+            .limit(100000)
             .execute()
         )
-        return getattr(r, "data", None) or []
+        rows = getattr(r, "data", None) or []
+
+        def coalesce_ts(row: Dict[str, Any]) -> str:
+            return (row.get("settled_at") or row.get("created_at") or "")
+
+        # Filter by coalesced timestamp >= start_date
+        filtered = [row for row in rows if coalesce_ts(row) >= from_dt]
+
+        # Sort chronologically by coalesced timestamp for compounding
+        filtered.sort(key=coalesce_ts)
+        return filtered
     except Exception as e:
         print(f"[bankroll] load from {SRC_TABLE} failed: {e}")
         return []
