@@ -32,7 +32,7 @@ UNIT_PCT          = float(os.getenv("BANKROLL_UNIT_PCT", "1.0"))      # 1 unit =
 BATCH_SIZE = int(os.getenv("BANKROLL_BATCH_SIZE", "1000"))
 
 # Source names
-VIEW_WITH_RESULTS = os.getenv("BANKROLL_RESULTS_VIEW", "value_predictions_with_results")
+VIEW_WITH_RESULTS = os.getenv("BANKROLL_RESULTS_VIEW", "value_predictions_with_result")
 
 # =============================================================================
 # Helpers
