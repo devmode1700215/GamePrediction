@@ -31,6 +31,9 @@ UNIT_PCT          = float(os.getenv("BANKROLL_UNIT_PCT", "1.0"))      # 1 unit =
 # Batching
 BATCH_SIZE = int(os.getenv("BANKROLL_BATCH_SIZE", "1000"))
 
+# Source names
+VIEW_WITH_RESULTS = os.getenv("BANKROLL_RESULTS_VIEW", "value_predictions_with_results")
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -54,7 +57,9 @@ def _load_state(label: str) -> Optional[float]:
         r = supabase.table("bankroll_state").select("bankroll").eq("label", label).limit(1).execute()
         rows = getattr(r, "data", None) or []
         if rows:
-            return _to_float(rows[0].get("bankroll"))
+            v = _to_float(rows[0].get("bankroll"))
+            if v is not None:
+                return v
     except Exception:
         pass
     return None
@@ -80,7 +85,7 @@ def _distinct(seq):
     return list(dict.fromkeys(seq))
 
 # =============================================================================
-# Data loaders
+# Loaders (path A: verifications + join by ID)
 # =============================================================================
 def _load_verifications_since(start_date: str) -> List[Dict[str, Any]]:
     try:
@@ -97,15 +102,12 @@ def _load_verifications_since(start_date: str) -> List[Dict[str, Any]]:
         return []
 
 def _load_predictions_by_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Load predictions WITHOUT filters so we can log exactly what gets filtered later.
-    """
     out: Dict[str, Dict[str, Any]] = {}
     for i in range(0, len(pred_ids), BATCH_SIZE):
         chunk = pred_ids[i:i+BATCH_SIZE]
         try:
             res = (supabase.table("value_predictions")
-                   .select("id, fixture_id, market, odds, confidence_pct, po_value, stake_amount")
+                   .select("id, fixture_id, market, odds, confidence_pct, po_value")
                    .in_("id", chunk)
                    .execute())
             rows = getattr(res, "data", None) or []
@@ -115,26 +117,37 @@ def _load_predictions_by_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             continue
     return out
 
-def _load_top10_map_by_prediction_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for i in range(0, len(pred_ids), BATCH_SIZE):
-        chunk = pred_ids[i:i+BATCH_SIZE]
-        try:
-            r = (supabase.table("top10_predictions")
-                 .select("id, prediction_id")
-                 .in_("prediction_id", chunk)
-                 .execute())
-            rows = getattr(r, "data", None) or []
-            for x in rows:
-                pid = x.get("prediction_id")
-                if pid:
-                    out[pid] = {"top10_id": x.get("id")}
-        except Exception:
-            continue
-    return out
+# =============================================================================
+# Loader (path B: direct from view with results)
+# =============================================================================
+def _load_verified_rows_from_view(start_date: str) -> List[Dict[str, Any]]:
+    """
+    Pull already-joined rows from value_predictions_with_results (or override view).
+    Expected columns (flexible; we map safely):
+      - id (prediction_id), fixture_id, market, odds, confidence_pct, po_value
+      - verified_at, is_correct
+    """
+    rows_all: List[Dict[str, Any]] = []
+    from_dt = f"{start_date}T00:00:00Z"
+    try:
+        # Pull in chunks ordered by verified_at ASC for stable compounding
+        # Some instances don’t support range pagination; we over-fetch once (limit 50000).
+        r = (
+            supabase.table(VIEW_WITH_RESULTS)
+            .select("id, prediction_id, fixture_id, market, odds, confidence_pct, po_value, verified_at, is_correct")
+            .gte("verified_at", from_dt)
+            .order("verified_at", desc=False)
+            .limit(50000)
+            .execute()
+        )
+        rows_all = getattr(r, "data", None) or []
+    except Exception as e:
+        print(f"[bankroll] fallback view load failed: {e}")
+        rows_all = []
+    return rows_all
 
 # =============================================================================
-# Core compounding logic
+# Core compounding
 # =============================================================================
 def _compute_stake_amount(current_bankroll: float, units: float, unit_pct: float) -> float:
     # stake_amount = bankroll * (units * unit_pct / 100)
@@ -147,84 +160,48 @@ def _profit(odds: float, stake_amount: float, is_correct: bool) -> float:
         return 0.0
     return round(stake_amount * (odds - 1.0), 2) if is_correct else round(-stake_amount, 2)
 
-def _make_logrow_common(
-    pid: str,
-    pred: Dict[str, Any],
-    when_iso: str,
-    odds: float,
-    starting: float,
-    after: float,
-    stake_units: float,
-    stake_amount: float,
-    is_correct: bool,
-) -> Dict[str, Any]:
+def _apply_filters(pred: Dict[str, Any]) -> Tuple[bool, str]:
+    if DISABLE_FILTERS:
+        return True, "filters_disabled"
+    # market
+    if ONLY_MARKETS and (pred.get("market") not in ONLY_MARKETS):
+        return False, "market"
+    # confidence
+    conf = _to_float(pred.get("confidence_pct"))
+    if (conf is None) or (conf < CONF_MIN):
+        return False, "conf"
+    # po_value
+    if ONLY_PO_VALUE and (not bool(pred.get("po_value"))):
+        return False, "po_value"
+    # odds present
+    if _to_float(pred.get("odds")) is None:
+        return False, "no_odds"
+    return True, "kept"
+
+def _log_row(pred_or_view_row: Dict[str, Any], when_iso: str,
+             starting: float, after: float,
+             odds: float, stake_amt: float, units: float,
+             is_correct: bool, source: str) -> Dict[str, Any]:
+    pid = pred_or_view_row.get("id") or pred_or_view_row.get("prediction_id")
     return {
         "id": str(uuid.uuid4()),
         "prediction_id": pid,
-        "fixture_id": pred.get("fixture_id"),
-        "market": pred.get("market"),
+        "fixture_id": pred_or_view_row.get("fixture_id"),
+        "market": pred_or_view_row.get("market"),
         "date": _date_str(when_iso),
-        "stake_units": stake_units,
-        "stake_amount": stake_amount,        # <— we persist stake_amount, not stake_pct
+        "stake_units": units,
+        "stake_amount": stake_amt,
         "odds": round(odds, 2) if odds is not None else None,
         "result": "win" if is_correct else "lose",
-        "profit": _profit(odds, stake_amount, is_correct),
+        "profit": _profit(odds, stake_amt, is_correct),
         "starting_bankroll": round(starting, 2),
         "bankroll_after": round(after, 2),
+        "source": source,
         "created_at": _now_iso(),
     }
 
-# =============================================================================
-# Filtering (with logging)
-# =============================================================================
-def _apply_filters(preds: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
-    """
-    Returns (kept_predictions_map, counters)
-    """
-    if DISABLE_FILTERS:
-        return preds, {"disabled": 1}
-
-    counters = {
-        "market": 0,
-        "conf": 0,
-        "po_value": 0,
-        "no_odds": 0,
-        "kept": 0,
-    }
-    kept: Dict[str, Dict[str, Any]] = {}
-
-    for pid, p in preds.items():
-        # odds present?
-        odds = _to_float(p.get("odds"))
-        if odds is None:
-            counters["no_odds"] += 1
-            continue
-
-        # market filter
-        if ONLY_MARKETS and (p.get("market") not in ONLY_MARKETS):
-            counters["market"] += 1
-            continue
-
-        # confidence filter
-        conf = _to_float(p.get("confidence_pct"))
-        if (conf is None) or (conf < CONF_MIN):
-            counters["conf"] += 1
-            continue
-
-        # po_value filter
-        if ONLY_PO_VALUE and (not bool(p.get("po_value"))):
-            counters["po_value"] += 1
-            continue
-
-        kept[pid] = p
-        counters["kept"] += 1
-
-    return kept, counters
-
-# =============================================================================
-# Public API: Full + Top10 ledgers
-# =============================================================================
-def _run_bankroll(mode_label: str, target_table: str, top10_only: bool) -> None:
+def _run_from_ids(mode_label: str, target_table: str, top10_only: bool) -> int:
+    """Returns number of rows written. 0 means: try the view fallback."""
     print(f"=== bankroll {'TOP10' if top10_only else 'FULL'} updater starting ===")
     print(f"UNITS_PER_BET={UNITS_PER_BET} | UNIT_PCT={UNIT_PCT} | START_DATE={START_DATE}")
     print(f"Filters: DISABLE_FILTERS={DISABLE_FILTERS} | ONLY_MARKETS={ONLY_MARKETS or 'ALL'} | "
@@ -234,16 +211,13 @@ def _run_bankroll(mode_label: str, target_table: str, top10_only: bool) -> None:
     if bankroll is None:
         bankroll = DEFAULT_BANKROLL
     bankroll = float(bankroll)
-    print(f"Starting bankroll{ ' (top10)' if top10_only else '' }: {bankroll:.2f}")
+    print(f"Starting bankroll: {bankroll:.2f}")
 
-    # Read existing logged ids for idempotency
     logged = _already_logged_ids(target_table)
 
-    # Load verifications
     verifs_raw = _load_verifications_since(START_DATE)
     print(f"Verifications fetched: {len(verifs_raw)}")
 
-    # Filter verifs (exclude dates, already logged)
     verifs: List[Dict[str, Any]] = []
     for v in verifs_raw:
         pid = v.get("prediction_id")
@@ -262,44 +236,46 @@ def _run_bankroll(mode_label: str, target_table: str, top10_only: bool) -> None:
 
     if not verifs or not unique_pids:
         print("No new verifications to process.")
-        return
+        return 0
 
-    # Load predictions by id (no filters)
-    preds_all = _load_predictions_by_ids(unique_pids)
-    print(f"Predictions fetched by id: {len(preds_all)}")
-    missing = set(unique_pids) - set(preds_all.keys())
+    preds_map = _load_predictions_by_ids(unique_pids)
+    print(f"Predictions fetched by id: {len(preds_map)}")
+    missing = set(unique_pids) - set(preds_map.keys())
     if missing:
         print(f"WARNING: {len(missing)} prediction_id(s) missing from value_predictions.")
 
-    # Optional membership in Top10
-    top10_map: Dict[str, Dict[str, Any]] = {}
+    if len(preds_map) == 0:
+        return 0  # signal to caller to try the view fallback
+
+    # Optional: ensure top10 membership (only when top10 ledger)
+    top10_set: Set[str] = set()
     if top10_only:
-        top10_map = _load_top10_map_by_prediction_ids(unique_pids)
-        print(f"Top10 membership found for {len(top10_map)} prediction_id(s).")
+        try:
+            r = (supabase.table("top10_predictions")
+                 .select("prediction_id")
+                 .in_("prediction_id", unique_pids)
+                 .execute())
+            rows = getattr(r, "data", None) or []
+            top10_set = {x["prediction_id"] for x in rows if x.get("prediction_id")}
+            print(f"Top10 membership found for {len(top10_set)} prediction_id(s).")
+        except Exception:
+            pass
 
-    # Apply filters (unless disabled)
-    preds_kept, counters = _apply_filters(preds_all)
-    if not DISABLE_FILTERS:
-        print(f"Filter counters: {counters}")
-    print(f"Kept predictions after filters: {len(preds_kept)}")
-
-    if not preds_kept:
-        print("No predictions matched filters.")
-        return
-
-    # Sort verifs chronologically & compound
+    # Compound
     verifs.sort(key=lambda v: v["verified_at"])
-    rows: List[Dict[str, Any]] = []
     current = round(bankroll, 2)
-    kept_count = 0
-    skipped_not_in_top10 = 0
+    rows: List[Dict[str, Any]] = []
+    kept = 0
     for v in verifs:
         pid = v["prediction_id"]
-        pred = preds_kept.get(pid)
+        pred = preds_map.get(pid)
         if not pred:
             continue
-        if top10_only and (pid not in top10_map):
-            skipped_not_in_top10 += 1
+        if top10_only and (pid not in top10_set):
+            continue
+
+        ok, reason = _apply_filters(pred)
+        if not ok:
             continue
 
         odds = _to_float(pred.get("odds"))
@@ -310,43 +286,94 @@ def _run_bankroll(mode_label: str, target_table: str, top10_only: bool) -> None:
         stake_amt = _compute_stake_amount(current, UNITS_PER_BET, UNIT_PCT)
         after = round(current + _profit(odds, stake_amt, is_correct), 2)
 
-        row = _make_logrow_common(
-            pid=pid,
-            pred=pred,
-            when_iso=v["verified_at"],
-            odds=odds,
-            starting=current,
-            after=after,
-            stake_units=UNITS_PER_BET,
-            stake_amount=stake_amt,
-            is_correct=is_correct,
-        )
-
-        if top10_only:
-            row["top10_id"] = top10_map.get(pid, {}).get("top10_id")
-            row["source"] = "top10"
-        else:
-            row["source"] = "all"
-
-        rows.append(row)
+        rows.append(_log_row(pred, v["verified_at"], current, after, odds, stake_amt, UNITS_PER_BET, is_correct,
+                             source="all" if not top10_only else "top10"))
         current = after
-        kept_count += 1
+        kept += 1
 
-    print(f"Rows to upsert: {len(rows)} | kept={kept_count} | skipped_not_in_top10={skipped_not_in_top10}")
-
+    print(f"Rows to upsert: {len(rows)}")
     if not rows:
-        print("All new verifications were filtered out.")
-        return
+        print("No predictions matched filters.")
+        return 0
 
-    try:
-        supabase.table(target_table).upsert(rows, on_conflict="prediction_id").execute()
-        print(f"Inserted/updated rows: {len(rows)} | Final bankroll: {current:.2f}")
-        _save_state(mode_label, current)
-    except Exception as e:
-        print(f"{target_table} upsert failed: {e}")
+    supabase.table(target_table).upsert(rows, on_conflict="prediction_id").execute()
+    print(f"Inserted/updated rows: {len(rows)} | Final bankroll: {current:.2f}")
+    _save_state(mode_label, current)
+    return len(rows)
 
+def _run_from_view(mode_label: str, target_table: str, top10_only: bool) -> int:
+    print(f"[bankroll] Falling back to {VIEW_WITH_RESULTS} (joined view)…")
+    bankroll = _load_state(mode_label)
+    if bankroll is None:
+        bankroll = DEFAULT_BANKROLL
+    current = round(float(bankroll), 2)
+
+    logged = _already_logged_ids(target_table)
+    rows_view = _load_verified_rows_from_view(START_DATE)
+    print(f"Rows from view since {START_DATE}: {len(rows_view)}")
+
+    if top10_only:
+        # keep only rows that exist in top10_predictions
+        try:
+            r = supabase.table("top10_predictions").select("prediction_id").execute()
+            tset = {x["prediction_id"] for x in (getattr(r, "data", None) or []) if x.get("prediction_id")}
+        except Exception:
+            tset = set()
+        rows_view = [r for r in rows_view if r.get("prediction_id") in tset]
+        print(f"Rows in view that are also Top10: {len(rows_view)}")
+
+    # sort chronologically
+    rows_view.sort(key=lambda r: r.get("verified_at") or "")
+
+    out_rows: List[Dict[str, Any]] = []
+    kept = 0
+    for r in rows_view:
+        pid = r.get("id") or r.get("prediction_id")
+        if not pid or pid in logged:
+            continue
+        if _date_str(r.get("verified_at") or "") in EXCLUDE_DATES:
+            continue
+
+        ok, reason = _apply_filters(r)
+        if not ok:
+            continue
+
+        odds = _to_float(r.get("odds"))
+        if odds is None:
+            continue
+        is_correct = bool(r.get("is_correct"))
+
+        stake_amt = _compute_stake_amount(current, UNITS_PER_BET, UNIT_PCT)
+        after = round(current + _profit(odds, stake_amt, is_correct), 2)
+
+        out_rows.append(_log_row(r, r.get("verified_at"), current, after, odds, stake_amt, UNITS_PER_BET, is_correct,
+                                 source="all" if not top10_only else "top10"))
+        current = after
+        kept += 1
+
+    print(f"[view] Rows to upsert: {len(out_rows)}")
+    if not out_rows:
+        print("[view] Nothing to write.")
+        return 0
+
+    supabase.table(target_table).upsert(out_rows, on_conflict="prediction_id").execute()
+    print(f"[view] Inserted/updated rows: {len(out_rows)} | Final bankroll: {current:.2f}")
+    _save_state(mode_label, current)
+    return len(out_rows)
+
+# Public API
 def update_bankroll_full(label: str = "bankroll_full") -> None:
-    _run_bankroll(mode_label=label, target_table="bankroll_log", top10_only=False)
+    wrote = _run_from_ids(mode_label=label, target_table="bankroll_log", top10_only=False)
+    if wrote == 0:
+        _run_from_view(mode_label=label, target_table="bankroll_log", top10_only=False)
 
 def update_bankroll_top10(label: str = "bankroll_top10") -> None:
-    _run_bankroll(mode_label=label, target_table="bankroll_log_top10", top10_only=True)
+    wrote = _run_from_ids(mode_label=label, target_table="bankroll_log_top10", top10_only=True)
+    if wrote == 0:
+        _run_from_view(mode_label=label, target_table="bankroll_log_top10", top10_only=True)
+
+# Auto-run when used as a module: python -m utils.update_bankroll_log
+if __name__ == "__main__":
+    print("✅ Supabase connection successful")
+    update_bankroll_full()
+    update_bankroll_top10()
