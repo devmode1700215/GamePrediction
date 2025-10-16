@@ -1,77 +1,84 @@
 # utils/insert_value_predictions.py
 from __future__ import annotations
-from typing import Any, Dict, Tuple, Optional
 
-from utils.supa import postgrest_upsert
+import os
+import json
+import logging
+from typing import Any, Dict, Tuple
 
-def _to_float(x) -> Optional[float]:
+from utils.supabaseClient import supabase
+
+DEFAULT_STAKE_AMOUNT = float(os.getenv("DEFAULT_STAKE_AMOUNT", "5"))
+
+def _try_upsert(payload: Dict[str, Any], include_stake_amount: bool) -> Tuple[int, str]:
+    data = dict(payload)
+    if not include_stake_amount:
+        data.pop("stake_amount", None)
+
     try:
-        return float(x)
-    except Exception:
-        return None
+        res = supabase.table("value_predictions").upsert(
+            data,
+            on_conflict="fixture_id,market",
+        ).execute()
 
-def _clip(x: Optional[float], lo: float, hi: float) -> Optional[float]:
-    try:
-        return max(lo, min(hi, float(x))) if x is not None else None
-    except Exception:
-        return None
+        # supabase-py returns an APIResponse-like object
+        rows = getattr(res, "data", None) or []
+        return (len(rows), "upserted" if rows else "nochange")
+    except Exception as e:
+        return (0, f"error:{e}")
 
-def _derive_confidence(pred: Dict[str, Any]) -> float:
-    pick = pred.get("prediction")
-    prob_over = _to_float(pred.get("prob_over"))
-    conf = _to_float(pred.get("confidence"))
-    if conf is None and prob_over is not None:
-        conf = prob_over if pick == "Over" else (1.0 - prob_over)
-    conf = _clip(conf, 0.05, 0.99)
-    return conf if conf is not None else 0.50
+def insert_value_predictions(pred: Dict[str, Any], odds_source: str = "apifootball") -> Tuple[int, str]:
+    """
+    pred is the dict returned by get_prediction(), minimally containing:
+      - fixture_id (int)
+      - market       (e.g. 'over_2_5')
+      - prediction   ('Over'/'Under')
+      - odds         (float)
+      - confidence   (0..1) or confidence_pct
+      - edge         (float, optional)
+      - po_value     (bool, optional)
 
-def insert_value_predictions(pred: Dict[str, Any], *, odds_source: str = None) -> Tuple[int, str]:
+    Writes with stake_amount=DEFAULT_STAKE_AMOUNT.
+    """
     fixture_id = pred.get("fixture_id")
-    market = pred.get("market") or "over_2_5"
-    if fixture_id is None or not market:
-        return (0, "missing fixture_id/market")
-
+    market     = pred.get("market") or "over_2_5"
     prediction = pred.get("prediction")
-    if prediction not in ("Over", "Under"):
-        prediction = "Over"
+    odds       = pred.get("odds")
+    confidence = pred.get("confidence") or pred.get("confidence_pct")
 
-    confidence = _derive_confidence(pred)
-    odds = _to_float(pred.get("odds"))
-    edge = _to_float(pred.get("edge"))
+    # normalize confidence to pct
+    if confidence is not None and confidence <= 1.0:
+        confidence_pct = round(float(confidence) * 100.0, 2)
+    else:
+        try:
+            confidence_pct = round(float(confidence), 2) if confidence is not None else None
+        except Exception:
+            confidence_pct = None
 
-    # Rationale: store NULL if empty
-    rationale = pred.get("rationale")
-    if isinstance(rationale, list):
-        rationale = " • ".join([str(x) for x in rationale[:6]])
-    if isinstance(rationale, str) and rationale.strip() == "":
-        rationale = None
-    if rationale == []:
-        rationale = None
-
-    is_ot = bool(pred.get("is_overtime_odds"))
-
-    row = {
+    payload = {
         "fixture_id": fixture_id,
         "market": market,
         "prediction": prediction,
-        "confidence_pct": round(confidence, 4),
-        "po_value": (edge is not None and edge > 0.0),
-        "stake_pct": 0.0,  # staking handled elsewhere
         "odds": odds,
-        "rationale": rationale,
-        "edge": round(edge, 4) if edge is not None else None,
-        "is_overtime_odds": is_ot,
+        "confidence_pct": confidence_pct,
+        "edge": pred.get("edge"),
+        "po_value": bool(pred.get("po_value", True)),
         "odds_source": odds_source,
+        # NEW: fixed stake (fallback to DEFAULT_STAKE_AMOUNT env)
+        "stake_amount": float(pred.get("stake_amount") or DEFAULT_STAKE_AMOUNT),
     }
 
-    resp = postgrest_upsert("value_predictions", [row], on_conflict="fixture_id,market")
+    # Optional rationale (short list of bullets or string)
+    rationale = pred.get("rationale")
+    if isinstance(rationale, list):
+        payload["rationale"] = json.dumps(rationale, ensure_ascii=False)
+    elif isinstance(rationale, str):
+        payload["rationale"] = rationale
 
-    # count from .data if present; else from status
-    data = getattr(resp, "data", None)
-    if isinstance(data, list):
-        return (len(data), "upserted")
-    status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
-    if isinstance(status, int) and status in (200, 201, 204):
-        return (1, "upserted")
-    err = getattr(resp, "error", None) or getattr(resp, "message", None) or f"unexpected:{type(resp).__name__}"
-    return (0, f"error:{err}")
+    # Try with stake_amount first; if schema doesn't have it, retry without.
+    count, msg = _try_upsert(payload, include_stake_amount=True)
+    if msg.startswith("error:") and "column" in msg.lower() and "stake_amount" in msg.lower():
+        logging.info("[value_predictions] stake_amount not in schema; retrying without it.")
+        count, msg = _try_upsert(payload, include_stake_amount=False)
+
+    return count, msg
