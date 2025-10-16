@@ -7,28 +7,23 @@ from typing import Optional, Set, List, Dict, Any
 
 from utils.supabaseClient import supabase
 
-# =============================================================================
-# Settings
-# =============================================================================
 START_DATE       = os.getenv("BANKROLL_START_DATE", "2025-06-22")
 EXCLUDE_DATES: Set[str] = set(filter(None, os.getenv("BANKROLL_EXCLUDE_DATES", "").split(",")))
 
-ODDS_MIN         = float(os.getenv("BANKROLL_ODDS_MIN", "1.7"))
-ODDS_MAX         = float(os.getenv("BANKROLL_ODDS_MAX", "2.3"))
-CONF_MIN         = float(os.getenv("BANKROLL_CONF_MIN", "0"))  # allow all by default now
+# Filters
+ODDS_MIN         = float(os.getenv("BANKROLL_ODDS_MIN", "1.0"))
+ODDS_MAX         = float(os.getenv("BANKROLL_ODDS_MAX", "100.0"))
+CONF_MIN         = float(os.getenv("BANKROLL_CONF_MIN", "0"))
 ONLY_MARKETS     = [m.strip() for m in os.getenv("BANKROLL_ONLY_MARKETS", "").split(",") if m.strip()]
 
+# NEW: disable odds filtering entirely
+DISABLE_ODDS_FILTER = os.getenv("BANKROLL_DISABLE_ODDS_FILTER", "true").lower() in ("1","true","yes","y")
+
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL_START", "1000"))
-
-# New: choose stake mode
 BANKROLL_MODE    = os.getenv("BANKROLL_MODE", "fixed").lower()  # "fixed" or "percent"
-FIXED_STAKE      = float(os.getenv("BANKROLL_FIXED_STAKE", "5"))  # used if mode=fixed
-
+FIXED_STAKE      = float(os.getenv("BANKROLL_FIXED_STAKE", "5"))
 BATCH_SIZE       = int(os.getenv("BANKROLL_BATCH_SIZE", "1000"))
 
-# =============================================================================
-# Helpers
-# =============================================================================
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -43,7 +38,6 @@ def _stake_fraction(raw) -> float:
     if v is None: return 0.0
     return v / 100.0 if v > 1 else v
 
-# ---- state snapshot (optional table) ----------------------------------------
 def _read_state_bankroll(label: str) -> Optional[float]:
     try:
         r = supabase.table("bankroll_state").select("bankroll").eq("label", label).limit(1).execute()
@@ -63,7 +57,6 @@ def _write_state_bankroll(label: str, bankroll: float):
     except Exception:
         pass
 
-# ---- idempotency set --------------------------------------------------------
 def _existing_logged_prediction_ids() -> Set[str]:
     try:
         r = supabase.table("bankroll_log").select("prediction_id").execute()
@@ -72,7 +65,6 @@ def _existing_logged_prediction_ids() -> Set[str]:
     except Exception:
         return set()
 
-# ---- verifications ----------------------------------------------------------
 def _load_verifications_since(start_date: str) -> List[Dict[str, Any]]:
     try:
         r = (
@@ -80,14 +72,13 @@ def _load_verifications_since(start_date: str) -> List[Dict[str, Any]]:
             .select("prediction_id, verified_at, is_correct")
             .gte("verified_at", f"{start_date}T00:00:00Z")
             .order("verified_at", desc=True)
-            .limit(10000)
+            .limit(20000)
             .execute()
         )
         return getattr(r, "data", None) or []
     except Exception:
         return []
 
-# ---- value_predictions with filters ----------------------------------------
 def _load_predictions_by_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for i in range(0, len(pred_ids), BATCH_SIZE):
@@ -98,9 +89,11 @@ def _load_predictions_by_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             ).in_("id", chunk)
             if CONF_MIN > 0:
                 q = q.gte("confidence_pct", CONF_MIN)
-            q = q.gte("odds", ODDS_MIN).lte("odds", ODDS_MAX)
             if ONLY_MARKETS:
                 q = q.in_("market", ONLY_MARKETS)
+            # NOTE: apply odds filter only if enabled
+            if not DISABLE_ODDS_FILTER:
+                q = q.gte("odds", ODDS_MIN).lte("odds", ODDS_MAX)
             res = q.execute()
             rows = getattr(res, "data", None) or []
             for r in rows:
@@ -109,15 +102,11 @@ def _load_predictions_by_ids(pred_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             continue
     return out
 
-# =============================================================================
-# Main entrypoint
-# =============================================================================
 def rebuild_or_append(label: str = "default"):
     print("=== bankroll_log updater starting ===")
     print(f"Mode={BANKROLL_MODE} | START_DATE={START_DATE} | EXCLUDE={sorted(EXCLUDE_DATES) if EXCLUDE_DATES else '[]'}")
-    print(f"Filters: CONF>={CONF_MIN} ODDS[{ODDS_MIN},{ODDS_MAX}] ONLY_MARKETS={ONLY_MARKETS or 'ALL'}")
+    print(f"Filters: CONF>={CONF_MIN} ODDS[{'OFF' if DISABLE_ODDS_FILTER else f'{ODDS_MIN},{ODDS_MAX}'}] ONLY_MARKETS={ONLY_MARKETS or 'ALL'}")
 
-    # starting bankroll (from state or last log), else default
     bankroll = _read_state_bankroll(label)
     if bankroll is None:
         try:
@@ -131,15 +120,12 @@ def rebuild_or_append(label: str = "default"):
     bankroll = float(bankroll)
     print(f"A) starting bankroll: {bankroll:.2f}")
 
-    # already logged
     logged_ids = _existing_logged_prediction_ids()
     print(f"B) already logged prediction_ids: {len(logged_ids)}")
 
-    # verifications window
     verifs_raw = _load_verifications_since(START_DATE)
     print(f"C) verifications fetched: {len(verifs_raw)}")
 
-    # filter verifs (idempotent; exclude dates)
     verifs = []
     excl_dates = 0
     for v in verifs_raw:
@@ -159,7 +145,6 @@ def rebuild_or_append(label: str = "default"):
         print("Nothing new to process.")
         return
 
-    # load predictions for those verifs
     pred_ids = list({v["prediction_id"] for v in verifs})
     preds = _load_predictions_by_ids(pred_ids)
     if not preds:
@@ -167,7 +152,6 @@ def rebuild_or_append(label: str = "default"):
         return
     print(f"E) loaded predictions passing filters: {len(preds)}")
 
-    # chronological order for compounding (if percent mode)
     verifs.sort(key=lambda v: v["verified_at"])
 
     logs_to_insert: List[Dict[str, Any]] = []
@@ -180,7 +164,11 @@ def rebuild_or_append(label: str = "default"):
             continue
 
         odds = _to_float(pred.get("odds"))
-        if odds is None or not (ODDS_MIN <= odds <= ODDS_MAX):
+        if odds is None:
+            continue
+
+        # if odds filter enabled, enforce bounds
+        if not DISABLE_ODDS_FILTER and not (ODDS_MIN <= odds <= ODDS_MAX):
             continue
 
         is_correct = bool(v.get("is_correct"))
@@ -190,7 +178,6 @@ def rebuild_or_append(label: str = "default"):
             frac = _stake_fraction(pred.get("stake_pct"))
             stake_amount = round(max(frac, 0.0) * current_bankroll, 2)
         else:
-            # fixed stake branch; prefer per-row stake_amount, fallback to env FIXED_STAKE
             stake_amount = _to_float(pred.get("stake_amount"))
             if stake_amount is None or stake_amount <= 0:
                 stake_amount = FIXED_STAKE
@@ -218,7 +205,6 @@ def rebuild_or_append(label: str = "default"):
         print("All new verifications were filtered out by rules.")
         return
 
-    # upsert by prediction_id (idempotent)
     try:
         supabase.table("bankroll_log").upsert(logs_to_insert, on_conflict="prediction_id").execute()
         print(f"G) upserted rows: {len(logs_to_insert)}")
